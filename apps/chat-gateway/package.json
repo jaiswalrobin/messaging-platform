@@ -26,11 +26,15 @@
     "@nestjs/jwt": "^11.0.2",
     "@nestjs/platform-express": "^11.0.1",
     "@nestjs/platform-ws": "^11.1.28",
+    "@nestjs/typeorm": "^11.0.3",
     "@nestjs/websockets": "^11.1.28",
     "bullmq": "^5.81.2",
+    "cassandra-driver": "^4.7.2",
     "ioredis": "^5.11.1",
+    "pg": "^8.16.3",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1",
+    "typeorm": "^1.1.0",
     "ws": "^8.21.1"
   },
   "devDependencies": {

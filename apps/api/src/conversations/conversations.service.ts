@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, ForbiddenException, BadRequestException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { ConversationParticipant } from './conversation-participant.entity';
@@ -121,7 +121,7 @@ export class ConversationsService {
     });
 
     if (!participant || participant.role !== 'admin' || participant.conversation.type !== 'group') {
-      throw new Error('Unauthorized or invalid conversation');
+      throw new ForbiddenException('Unauthorized or invalid conversation');
     }
 
     participant.conversation.title = title;
@@ -135,7 +135,7 @@ export class ConversationsService {
     });
 
     if (!adminParticipant || adminParticipant.role !== 'admin' || adminParticipant.conversation.type !== 'group') {
-      throw new Error('Unauthorized or invalid conversation');
+      throw new ForbiddenException('Unauthorized or invalid conversation');
     }
 
     // Filter out participants already in the group
@@ -163,7 +163,7 @@ export class ConversationsService {
 
   async createDirectConversation(userId: string, targetUserId: string) {
     if (userId === targetUserId) {
-      throw new Error('Cannot create a direct conversation with yourself');
+      throw new BadRequestException('Cannot create a direct conversation with yourself');
     }
 
     // Check if direct conversation already exists
