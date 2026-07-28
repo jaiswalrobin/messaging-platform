@@ -11,8 +11,8 @@ import { AuthModule } from './auth/auth.module'; // Add this
       type: 'postgres',
       host: 'localhost',
       port: 5432,
-      username: 'rahulkumar90270', // Replace with your Mac username if different
-      password: '',
+      username: 'admin', // Replace with your Mac username if different
+      password: 'admin',
       database: 'chat_db',
       autoLoadEntities: true,
       synchronize: true,
@@ -23,4 +23,4 @@ import { AuthModule } from './auth/auth.module'; // Add this
   controllers: [AppController],
   providers: [AppService],
 })
-export class AppModule {}
+export class AppModule { }

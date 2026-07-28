@@ -34,9 +34,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
 
     try {
-      const payload = this.jwtService.verify(token, {
-        secret: process.env.JWT_SECRET,
-      });
+      const payload = this.jwtService.verify(token);
       client.user = payload;
       this.connectedUsers.set(payload.sub, client);
       console.log(`✅ User connected: ${payload.sub}`);
