@@ -4,6 +4,7 @@ import {
   Column,
   CreateDateColumn,
 } from 'typeorm';
+import { IsEmail, IsNotEmpty, IsString } from 'class-validator';
 
 @Entity('users')
 export class User {
@@ -11,10 +12,12 @@ export class User {
   id: string;
 
   @Column({ unique: true })
+  @IsEmail()
+  @IsNotEmpty()
   email: string;
 
   @Column()
-  password: string; // We will store the hashed password here
+  password: string;
 
   @CreateDateColumn()
   createdAt: Date;
