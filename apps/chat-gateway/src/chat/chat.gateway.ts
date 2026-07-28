@@ -8,24 +8,42 @@ import {
   MessageBody,
 } from '@nestjs/websockets';
 import { UseGuards } from '@nestjs/common';
-import { WebSocket } from 'ws'; // Correct import for raw ws library
+import { WebSocket, Server } from 'ws'; // Correct import for raw ws library
 import { WsAuthGuard } from '../auth/ws-auth.guard';
 import type { SendMessagePayload } from '@chat/shared-types';
+import { JwtService } from '@nestjs/jwt';
 
 @WebSocketGateway(8080, { cors: true })
 export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
-  server: WebSocket.Server;
+  server: Server;
 
   // Track connected users (In memory for now, we will move this to Redis later)
   private connectedUsers = new Map<string, WebSocket>();
 
-  handleConnection(client: WebSocket, ...args: any[]) {
-    // The WsAuthGuard runs before this. If we are here, client.user is populated.
-    const userId = (client as any).user?.sub;
-    console.log(`✅ User connected: ${userId}`);
+  constructor(private jwtService: JwtService) { }
 
-    this.connectedUsers.set(userId, client);
+  handleConnection(client: any, request: any) {
+    const url = new URL(request.url, 'http://localhost');
+    const token = url.searchParams.get('token');
+
+    if (!token) {
+      console.log('❌ Rejected connection: no token provided');
+      client.close(1008, 'Unauthorized');
+      return;
+    }
+
+    try {
+      const payload = this.jwtService.verify(token, {
+        secret: process.env.JWT_SECRET,
+      });
+      client.user = payload;
+      this.connectedUsers.set(payload.sub, client);
+      console.log(`✅ User connected: ${payload.sub}`);
+    } catch {
+      console.log('❌ Rejected connection: invalid or missing token');
+      client.close(1008, 'Unauthorized');
+    }
   }
 
   handleDisconnect(client: WebSocket) {
@@ -40,16 +58,16 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @SubscribeMessage('message')
   handleMessage(
     @ConnectedSocket() client: WebSocket,
-    @MessageBody() payload: { event: string; data: SendMessagePayload },
+    @MessageBody() data: SendMessagePayload,
   ) {
     const senderId = (client as any).user.sub;
-    console.log(`📨 Received message from ${senderId}:`, payload.data);
+    console.log(`📨 Received message from ${senderId}:`, data);
 
     // Echo it back to the sender to prove it works
     return {
       event: 'message_sent',
       data: {
-        ...payload.data,
+        ...data,
         senderId,
         status: 'sent',
       },
