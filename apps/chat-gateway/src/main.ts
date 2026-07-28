@@ -8,7 +8,7 @@ async function bootstrap() {
   // Tell NestJS to use the raw 'ws' library instead of socket.io
   app.useWebSocketAdapter(new WsAdapter(app));
 
-  await app.listen(8081);
+  await app.listen(8080);
   console.log('🚀 Chat Gateway is running on ws://localhost:8080');
 }
 bootstrap();
