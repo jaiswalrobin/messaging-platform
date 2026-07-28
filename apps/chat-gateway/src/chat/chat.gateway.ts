@@ -13,7 +13,7 @@ import { WsAuthGuard } from '../auth/ws-auth.guard';
 import type { SendMessagePayload } from '@chat/shared-types';
 import { JwtService } from '@nestjs/jwt';
 
-@WebSocketGateway(8080, { cors: true })
+@WebSocketGateway({ cors: true })
 export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   @WebSocketServer()
   server: Server;
@@ -21,7 +21,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   // Track connected users (In memory for now, we will move this to Redis later)
   private connectedUsers = new Map<string, WebSocket>();
 
-  constructor(private jwtService: JwtService) { }
+  constructor(private jwtService: JwtService) {}
 
   handleConnection(client: any, request: any) {
     const url = new URL(request.url, 'http://localhost');

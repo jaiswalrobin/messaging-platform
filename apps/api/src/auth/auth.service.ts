@@ -14,12 +14,6 @@ export class AuthService {
   ) {}
 
   async register(email: string, password: string) {
-
-    if (!email.trim() || !password.trim()) {
-      throw new BadRequestException('Email and password are required');
-    }
-
-
     // Check if user exists
     const existingUser = await this.userRepository.findOne({
       where: { email },
