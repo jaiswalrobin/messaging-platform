@@ -1,7 +1,10 @@
-import { Controller, Get, Post, Body, UseGuards, Request } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Body, Param, UseGuards, Request } from '@nestjs/common';
 import { ConversationsService } from './conversations.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { CreateGroupDto } from './dto/create-group.dto';
+import { UpdateGroupDto } from './dto/update-group.dto';
+import { AddParticipantsDto } from './dto/add-participants.dto';
+import { CreateDirectDto } from './dto/create-direct.dto';
 
 @Controller('conversations')
 export class ConversationsController {
@@ -21,5 +24,23 @@ export class ConversationsController {
       body.title,
       body.participantIds,
     );
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Patch(':id/title')
+  updateGroupTitle(@Param('id') id: string, @Body() body: UpdateGroupDto, @Request() req: any) {
+    return this.conversationsService.updateGroupTitle(req.user.userId, id, body.title);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post(':id/participants')
+  addGroupParticipants(@Param('id') id: string, @Body() body: AddParticipantsDto, @Request() req: any) {
+    return this.conversationsService.addGroupParticipants(req.user.userId, id, body.participantIds);
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Post('direct')
+  createDirectConversation(@Body() body: CreateDirectDto, @Request() req: any) {
+    return this.conversationsService.createDirectConversation(req.user.userId, body.targetUserId);
   }
 }
