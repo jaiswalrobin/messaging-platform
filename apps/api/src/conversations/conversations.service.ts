@@ -50,4 +50,48 @@ export class ConversationsService {
 
     return conversations;
   }
+
+  async createGroup(creatorId: string, title: string, participantIds: string[]) {
+    // Start transaction manually since we're using repositories
+    const queryRunner = this.conversationRepo.manager.connection.createQueryRunner();
+    await queryRunner.connect();
+    await queryRunner.startTransaction();
+
+    try {
+      // 1. Create the conversation
+      const conversation = this.conversationRepo.create({
+        title,
+        type: 'group',
+      });
+      const savedConversation = await queryRunner.manager.save(conversation);
+
+      // 2. Create the creator as admin
+      const adminParticipant = this.participantRepo.create({
+        conversationId: savedConversation.id,
+        userId: creatorId,
+        role: 'admin',
+      });
+      await queryRunner.manager.save(adminParticipant);
+
+      // 3. Create other participants as members
+      for (const participantId of participantIds) {
+        if (participantId === creatorId) continue; // Don't add creator twice
+
+        const memberParticipant = this.participantRepo.create({
+          conversationId: savedConversation.id,
+          userId: participantId,
+          role: 'member',
+        });
+        await queryRunner.manager.save(memberParticipant);
+      }
+
+      await queryRunner.commitTransaction();
+      return savedConversation;
+    } catch (err) {
+      await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
 }
