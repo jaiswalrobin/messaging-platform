@@ -15,10 +15,9 @@ import { ParticipantsModule } from './participants/participants.module';
       password: process.env.DB_PASSWORD ?? 'admin',
       database: process.env.DB_NAME ?? 'chat_db',
       autoLoadEntities: true,
-      // synchronize: true — chat-gateway minimal ConversationParticipant entity
-      // only maps (conversation_id, user_id) as read-only.
-      // Message persistence is handled by CassandraService.
-      synchronize: true,
+      // synchronize: false — chat-gateway minimal ConversationParticipant entity
+      // reads from DB owned by `api`. `api` handles schema synchronization/migrations.
+      synchronize: false,
     }),
     JwtModule.register({
       // TODO: move to process.env.JWT_SECRET via ConfigModule

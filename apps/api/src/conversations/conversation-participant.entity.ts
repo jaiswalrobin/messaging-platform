@@ -11,10 +11,10 @@ import { User } from '../users/user.entity';
 
 @Entity('conversation_participants')
 export class ConversationParticipant {
-  @PrimaryColumn({ name: 'conversation_id' })
+  @PrimaryColumn('uuid', { name: 'conversation_id' })
   conversationId: string;
 
-  @PrimaryColumn({ name: 'user_id' })
+  @PrimaryColumn('uuid', { name: 'user_id' })
   userId: string;
 
   @Column({ default: 'member' })

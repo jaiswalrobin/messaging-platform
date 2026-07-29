@@ -6,9 +6,9 @@ import { Entity, PrimaryColumn } from 'typeorm';
 // present in the DB but absent from this entity definition.
 @Entity('conversation_participants')
 export class ConversationParticipant {
-  @PrimaryColumn({ name: 'conversation_id' })
+  @PrimaryColumn('uuid', { name: 'conversation_id' })
   conversationId: string;
 
-  @PrimaryColumn({ name: 'user_id' })
+  @PrimaryColumn('uuid', { name: 'user_id' })
   userId: string;
 }
