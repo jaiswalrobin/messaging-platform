@@ -4,6 +4,7 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { ChatGateway } from './chat/chat.gateway';
 import { MessagesModule } from './messages/messages.module';
 import { ParticipantsModule } from './participants/participants.module';
+import { KafkaModule } from './kafka/kafka.module';
 
 @Module({
   imports: [
@@ -26,6 +27,7 @@ import { ParticipantsModule } from './participants/participants.module';
     }),
     MessagesModule,
     ParticipantsModule,
+    KafkaModule,
   ],
   providers: [ChatGateway],
   // AppController and AppService (dead boilerplate) removed

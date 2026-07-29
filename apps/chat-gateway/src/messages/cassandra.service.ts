@@ -28,10 +28,10 @@ export class CassandraService implements OnModuleInit, OnModuleDestroy {
 
     this.logger.log(`Connecting to Cassandra at ${contactPoints.join(',')}`);
 
-    // 2. Create keyspace and table
+    // 2. Create keyspace and tables
     await this.initSchema();
-    
-    this.logger.log(`✅ Cassandra keyspace '${this.keyspace}' and messages table initialized`);
+
+    this.logger.log(`✅ Cassandra keyspace '${this.keyspace}' and tables initialized`);
   }
 
   async onModuleDestroy() {
@@ -45,7 +45,7 @@ export class CassandraService implements OnModuleInit, OnModuleDestroy {
       WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}
     `);
 
-    // Create table (prefix with keyspace name)
+    // messages table: partitioned by conversation, ordered by time DESC
     await this.client.execute(`
       CREATE TABLE IF NOT EXISTS ${this.keyspace}.messages (
         conversation_id text,
@@ -56,35 +56,51 @@ export class CassandraService implements OnModuleInit, OnModuleDestroy {
         PRIMARY KEY (conversation_id, created_at, id)
       ) WITH CLUSTERING ORDER BY (created_at DESC, id DESC)
     `);
+
+    // message_receipts table: tracks per-user delivery/read status
+    // Partitioned by conversation_id for fast lookup.
+    // Clustering by message_id and user_id.
+    await this.client.execute(`
+      CREATE TABLE IF NOT EXISTS ${this.keyspace}.message_receipts (
+        conversation_id text,
+        message_id text,
+        user_id text,
+        status text,
+        updated_at timestamp,
+        PRIMARY KEY (conversation_id, message_id, user_id)
+      )
+    `);
   }
+
+  // ── Message Persistence ─────────────────────────────────────────────────────
 
   async saveMessage(
     conversationId: string,
     senderId: string,
     content: string,
+    messageId?: string,
+    createdAt?: Date,
   ): Promise<MessageRecord> {
-    const id = types.TimeUuid.now();
-    const createdAt = new Date();
+    const id = messageId ? types.TimeUuid.fromString(messageId) : types.TimeUuid.now();
+    const ts = createdAt ?? new Date();
 
-    // Prefix table with keyspace
     const query = `
       INSERT INTO ${this.keyspace}.messages (conversation_id, created_at, id, sender_id, content)
       VALUES (?, ?, ?, ?, ?)
     `;
 
-    await this.client.execute(query, [conversationId, createdAt, id, senderId, content], { prepare: true });
+    await this.client.execute(query, [conversationId, ts, id, senderId, content], { prepare: true });
 
     return {
       id: id.toString(),
       conversationId,
       senderId,
       content,
-      createdAt,
+      createdAt: ts,
     };
   }
 
   async getMessages(conversationId: string, limit = 20): Promise<MessageRecord[]> {
-    // Prefix table with keyspace
     const query = `
       SELECT conversation_id, created_at, id, sender_id, content
       FROM ${this.keyspace}.messages
@@ -100,6 +116,60 @@ export class CassandraService implements OnModuleInit, OnModuleDestroy {
       senderId: row.sender_id,
       content: row.content,
       createdAt: row.created_at,
+    }));
+  }
+
+  // ── Receipt Tracking ────────────────────────────────────────────────────────
+
+  /**
+   * Upsert a delivery or read receipt for a specific message and user.
+   */
+  async upsertReceipt(
+    conversationId: string,
+    messageId: string,
+    userId: string,
+    status: 'delivered' | 'read',
+  ): Promise<void> {
+    const query = `
+      INSERT INTO ${this.keyspace}.message_receipts (conversation_id, message_id, user_id, status, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+    `;
+    await this.client.execute(
+      query,
+      [conversationId, messageId, userId, status, new Date()],
+      { prepare: true },
+    );
+  }
+
+  /**
+   * Mark all messages in a conversation as read for a user up to a given message.
+   */
+  async markConversationRead(
+    conversationId: string,
+    userId: string,
+    upToMessageId: string,
+  ): Promise<void> {
+    await this.upsertReceipt(conversationId, upToMessageId, userId, 'read');
+  }
+
+  /**
+   * Get read receipts for a conversation (to show who read what).
+   */
+  async getReceipts(
+    conversationId: string,
+    messageId: string,
+  ): Promise<{ userId: string; status: string; updatedAt: Date }[]> {
+    const query = `
+      SELECT user_id, status, updated_at
+      FROM ${this.keyspace}.message_receipts
+      WHERE conversation_id = ? AND message_id = ?
+    `;
+    const result = await this.client.execute(query, [conversationId, messageId], { prepare: true });
+
+    return result.rows.map((row) => ({
+      userId: row.user_id,
+      status: row.status,
+      updatedAt: row.updated_at,
     }));
   }
 }
