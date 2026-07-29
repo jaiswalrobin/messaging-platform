@@ -139,6 +139,25 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
   }
 
+  // ─── Fetch history handler ──────────────────────────────────────────────────
+
+  @UseGuards(WsAuthGuard)
+  @SubscribeMessage('fetch_messages')
+  async handleFetchMessages(
+    @ConnectedSocket() client: WebSocket,
+    @MessageBody() data: { conversationId: string; limit?: number },
+  ): Promise<void> {
+    const limit = data.limit ?? 20;
+    this.logger.log(`📜 Fetching last ${limit} messages for conversation ${data.conversationId}`);
+
+    const messages = await this.cassandraService.getMessages(data.conversationId, limit);
+
+    this.send(client, 'messages_history', {
+      conversationId: data.conversationId,
+      messages,
+    });
+  }
+
   // ─── Helpers ────────────────────────────────────────────────────────────────
 
   /** Send a typed WS event frame to a socket. */

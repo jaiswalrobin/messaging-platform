@@ -83,7 +83,7 @@ export class CassandraService implements OnModuleInit, OnModuleDestroy {
     };
   }
 
-  async getMessages(conversationId: string, limit = 50): Promise<MessageRecord[]> {
+  async getMessages(conversationId: string, limit = 20): Promise<MessageRecord[]> {
     // Prefix table with keyspace
     const query = `
       SELECT conversation_id, created_at, id, sender_id, content

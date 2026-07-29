@@ -1,9 +1,5 @@
-import { Entity, PrimaryColumn } from 'typeorm';
+import { Entity, PrimaryColumn, Column, CreateDateColumn } from 'typeorm';
 
-// Minimal read-only mirror of the conversation_participants table owned by `api`.
-// Only the columns needed by chat-gateway are mapped here.
-// synchronize:true will NOT drop existing columns (role, joined_at) that are
-// present in the DB but absent from this entity definition.
 @Entity('conversation_participants')
 export class ConversationParticipant {
   @PrimaryColumn('uuid', { name: 'conversation_id' })
@@ -11,4 +7,10 @@ export class ConversationParticipant {
 
   @PrimaryColumn('uuid', { name: 'user_id' })
   userId: string;
+
+  @Column({ default: 'member' })
+  role: string;
+
+  @CreateDateColumn({ name: 'joined_at' })
+  joinedAt: Date;
 }
