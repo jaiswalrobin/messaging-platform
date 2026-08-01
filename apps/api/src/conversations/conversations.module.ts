@@ -11,6 +11,5 @@ import { User } from '../users/user.entity';
   imports: [TypeOrmModule.forFeature([Conversation, ConversationParticipant, User])],
   controllers: [ConversationsController, InternalReadsController],
   providers: [ConversationsService],
-  exports: [ConversationsService],
 })
 export class ConversationsModule {}

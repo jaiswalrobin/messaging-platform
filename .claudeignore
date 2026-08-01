@@ -1,0 +1,10 @@
+# Secrets and environment variables
+.env*
+*.pem
+*.key
+credentials.json
+
+# Irrelevant or large directories
+node_modules/
+dist/
+build/

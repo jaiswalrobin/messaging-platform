@@ -3,6 +3,8 @@ import { JwtModule } from '@nestjs/jwt';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { getJwtSecret, getTypeOrmConfig, JWT_EXPIRES_IN } from '@chat/shared-types';
 import { ChatGateway } from './chat/chat.gateway';
+import { ChatConsumerService } from './chat/chat-consumer.service';
+import { ConnectionRegistryService } from './chat/connection-registry.service';
 import { HealthController } from './health/health.controller';
 import { InvalidateController } from './internal/invalidate.controller';
 import { ApiClientService } from './internal/api-client.service';
@@ -24,7 +26,7 @@ import { KafkaModule } from './kafka/kafka.module';
     KafkaModule,
   ],
   controllers: [HealthController, InvalidateController],
-  providers: [ChatGateway, ApiClientService],
+  providers: [ChatGateway, ApiClientService, ConnectionRegistryService, ChatConsumerService],
   // AppController and AppService (dead boilerplate) removed
 })
 export class AppModule {}

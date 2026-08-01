@@ -1,8 +1,9 @@
-import { Injectable, UnauthorizedException, BadRequestException, ConflictException } from '@nestjs/common';
+import { Injectable, UnauthorizedException, ConflictException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { JwtService } from '@nestjs/jwt';
 import * as bcrypt from 'bcrypt';
+import { UserAuthResponse } from '@chat/shared-types';
 import { User } from '../users/user.entity';
 
 @Injectable()
@@ -13,8 +14,7 @@ export class AuthService {
     private jwtService: JwtService,
   ) {}
 
-  async register(email: string, password: string) {
-    // Check if user exists
+  async register(email: string, password: string): Promise<UserAuthResponse> {
     const existingUser = await this.userRepository.findOne({
       where: { email },
     });
@@ -22,21 +22,18 @@ export class AuthService {
       throw new ConflictException('User already exists');
     }
 
-    // Hash password
     const salt = await bcrypt.genSalt();
     const passwordHash = await bcrypt.hash(password, salt);
 
-    // Create and save user
     const user = this.userRepository.create({ email, password: passwordHash });
     const savedUser = await this.userRepository.save(user);
 
-    // Generate JWT
     const token = this.generateToken(savedUser);
 
     return { userId: savedUser.id, token };
   }
 
-  async login(email: string, password: string) {
+  async login(email: string, password: string): Promise<UserAuthResponse> {
     const user = await this.userRepository.findOne({ where: { email } });
     if (!user) {
       throw new UnauthorizedException('Invalid credentials');

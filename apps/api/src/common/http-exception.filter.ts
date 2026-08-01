@@ -7,7 +7,6 @@ import {
   Logger,
 } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
-import type { Response } from 'express';
 
 @Catch()
 export class HttpExceptionFilter implements ExceptionFilter {
@@ -16,8 +15,8 @@ export class HttpExceptionFilter implements ExceptionFilter {
   constructor(private readonly httpAdapterHost: HttpAdapterHost) {}
 
   catch(exception: unknown, host: ArgumentsHost) {
+    const { httpAdapter } = this.httpAdapterHost;
     const ctx = host.switchToHttp();
-    const reply = ctx.getResponse<Response>();
 
     const status =
       exception instanceof HttpException
@@ -35,9 +34,8 @@ export class HttpExceptionFilter implements ExceptionFilter {
       exception instanceof Error ? exception.stack : undefined,
     );
 
-    reply.status(status).send({
-      statusCode: status,
-      message,
-    });
+    // Framework-agnostic reply via the injected adapter — no express `Response`
+    // casting needed.
+    httpAdapter.reply(ctx.getResponse(), { statusCode: status, message }, status);
   }
 }

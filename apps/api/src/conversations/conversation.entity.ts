@@ -8,6 +8,9 @@ import {
 } from 'typeorm';
 import { ConversationParticipant } from './conversation-participant.entity';
 
+/** Kind of conversation — drives the membership rules in ConversationsService. */
+export type ConversationType = 'direct' | 'group';
+
 @Entity('conversations')
 export class Conversation {
   @PrimaryGeneratedColumn('uuid')
@@ -17,7 +20,7 @@ export class Conversation {
   title: string;
 
   @Column({ default: 'direct' })
-  type: string;
+  type: ConversationType;
 
   @Column({ name: 'direct_key', type: 'varchar', nullable: true, unique: true })
   directKey: string | null;

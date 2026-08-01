@@ -11,6 +11,10 @@ import type { KafkaChatEvent } from '@chat/shared-types';
 
 export const KAFKA_CHAT_TOPIC = 'chat-events';
 
+// Bounded processing attempts per event before it is skipped loudly; see the
+// "never rethrow" comment block in onModuleInit below.
+const MAX_ATTEMPTS = 3;
+
 @Injectable()
 export class KafkaService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(KafkaService.name);
@@ -87,7 +91,6 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
             return;
           }
 
-          const MAX_ATTEMPTS = 3;
           for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             try {
               await Promise.all(this.handlers.map((h) => h(event)));
@@ -153,9 +156,5 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
    */
   onEvent(handler: (event: KafkaChatEvent) => Promise<void>): void {
     this.handlers.push(handler);
-  }
-
-  get isAvailable(): boolean {
-    return this.available;
   }
 }

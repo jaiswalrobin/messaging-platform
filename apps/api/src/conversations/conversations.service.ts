@@ -1,6 +1,6 @@
 import { Injectable, ForbiddenException, BadRequestException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { In, Repository, EntityManager } from 'typeorm';
 import { getInternalApiKey } from '@chat/shared-types';
 import { ConversationParticipant } from './conversation-participant.entity';
 import { Conversation } from './conversation.entity';
@@ -55,6 +55,20 @@ export class ConversationsService {
     }));
   }
 
+  private toConversationDto(
+    conversation: Conversation,
+    participants: ConversationParticipant[],
+  ) {
+    return {
+      id: conversation.id,
+      title: conversation.title,
+      type: conversation.type,
+      createdAt: conversation.createdAt,
+      updatedAt: conversation.updatedAt,
+      participants: this.mapParticipants(participants),
+    };
+  }
+
   private async loadConversationWithParticipants(conversationId: string) {
     const conversation = await this.conversationRepo.findOne({
       where: { id: conversationId },
@@ -68,14 +82,7 @@ export class ConversationsService {
       relations: { user: true },
     });
 
-    return {
-      id: conversation.id,
-      title: conversation.title,
-      type: conversation.type,
-      createdAt: conversation.createdAt,
-      updatedAt: conversation.updatedAt,
-      participants: this.mapParticipants(participants),
-    };
+    return this.toConversationDto(conversation, participants);
   }
 
   private async findGroupAdmin(
@@ -126,40 +133,53 @@ export class ConversationsService {
       participantsByConversation.set(participant.conversationId, list);
     }
 
-    return participations.map((participation) => {
-      const conversation = participation.conversation;
-      return {
-        id: conversation.id,
-        title: conversation.title,
-        type: conversation.type,
-        createdAt: conversation.createdAt,
-        updatedAt: conversation.updatedAt,
-        participants: this.mapParticipants(participantsByConversation.get(conversation.id) ?? []),
-      };
-    });
+    return participations.map((participation) =>
+      this.toConversationDto(
+        participation.conversation,
+        participantsByConversation.get(participation.conversation.id) ?? [],
+      ),
+    );
   }
 
-  async createGroup(creatorId: string, title: string, participantIds: string[]) {
-    // Start transaction manually since we're using repositories
+  /**
+   * Run a unit of work in its own transaction: create a query runner, begin,
+   * commit on success, roll back and rethrow on failure, always release.
+   */
+  private async withTransaction<T>(
+    fn: (manager: EntityManager) => Promise<T>,
+  ): Promise<T> {
     const queryRunner = this.conversationRepo.manager.connection.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
 
     try {
+      const result = await fn(queryRunner.manager);
+      await queryRunner.commitTransaction();
+      return result;
+    } catch (err) {
+      await queryRunner.rollbackTransaction();
+      throw err;
+    } finally {
+      await queryRunner.release();
+    }
+  }
+
+  async createGroup(creatorId: string, title: string, participantIds: string[]) {
+    const savedConversation = await this.withTransaction(async (manager) => {
       // 1. Create the conversation
       const conversation = this.conversationRepo.create({
         title,
         type: 'group',
       });
-      const savedConversation = await queryRunner.manager.save(conversation);
+      const saved = await manager.save(conversation);
 
       // 2. Create the creator as admin
       const adminParticipant = this.participantRepo.create({
-        conversationId: savedConversation.id,
+        conversationId: saved.id,
         userId: creatorId,
         role: 'admin',
       });
-      await queryRunner.manager.save(adminParticipant);
+      await manager.save(adminParticipant);
 
       // 3. Verify all participant IDs exist before inserting them
       const missingIds = await this.findMissingUserIds(participantIds);
@@ -173,23 +193,18 @@ export class ConversationsService {
         if (participantId === creatorId) continue; // Don't add creator twice
 
         const memberParticipant = this.participantRepo.create({
-          conversationId: savedConversation.id,
+          conversationId: saved.id,
           userId: participantId,
           role: 'member',
         });
-        await queryRunner.manager.save(memberParticipant);
+        await manager.save(memberParticipant);
       }
 
-      await queryRunner.commitTransaction();
+      return saved;
+    });
 
-      // Return fully loaded conversation matching getConversationsForUser structure
-      return this.loadConversationWithParticipants(savedConversation.id);
-    } catch (err) {
-      await queryRunner.rollbackTransaction();
-      throw err;
-    } finally {
-      await queryRunner.release();
-    }
+    // Return fully loaded conversation matching getConversationsForUser structure
+    return this.loadConversationWithParticipants(savedConversation.id);
   }
 
   async updateGroupTitle(userId: string, conversationId: string, title: string) {
@@ -200,7 +215,11 @@ export class ConversationsService {
     }
 
     participant.conversation.title = title;
-    return this.conversationRepo.save(participant.conversation);
+    await this.conversationRepo.save(participant.conversation);
+
+    // Return the same DTO shape as every other conversation endpoint — the
+    // conversation is guaranteed to exist (findGroupAdmin just loaded it).
+    return (await this.loadConversationWithParticipants(conversationId))!;
   }
 
   async addGroupParticipants(userId: string, conversationId: string, participantIds: string[]) {
@@ -252,7 +271,9 @@ export class ConversationsService {
       }
     }
 
-    return adminParticipant.conversation;
+    // Return the same DTO shape as every other conversation endpoint — the
+    // conversation is guaranteed to exist (findGroupAdmin just loaded it).
+    return (await this.loadConversationWithParticipants(conversationId))!;
   }
 
   /**
@@ -340,8 +361,10 @@ export class ConversationsService {
       throw new BadRequestException('Target user does not exist');
     }
 
-    // Check if direct conversation already exists
-    // We look for a conversation of type 'direct' where both users are participants
+    // Check if direct conversation already exists.
+    // Table names mirror the entities: `conversations` = Conversation,
+    // `conversation_participants` = ConversationParticipant. We look for a
+    // conversation of type 'direct' where both users are participants.
     // Note: this assumes direct conversations always have exactly 2 participants
     const query = `
       SELECT c.id
@@ -362,40 +385,37 @@ export class ConversationsService {
     // Deterministic key so concurrent creations collide on the unique index
     const directKey = [userId, targetUserId].sort().join('|');
 
-    // Start transaction manually
-    const queryRunner = this.conversationRepo.manager.connection.createQueryRunner();
-    await queryRunner.connect();
-    await queryRunner.startTransaction();
-
     try {
-      const conversation = this.conversationRepo.create({
-        type: 'direct',
-        directKey,
-      });
-      const savedConversation = await queryRunner.manager.save(conversation);
+      const savedConversation = await this.withTransaction(async (manager) => {
+        const conversation = this.conversationRepo.create({
+          type: 'direct',
+          directKey,
+        });
+        const saved = await manager.save(conversation);
 
-      const p1 = this.participantRepo.create({
-        conversationId: savedConversation.id,
-        userId: userId,
-        role: 'member',
-      });
+        const p1 = this.participantRepo.create({
+          conversationId: saved.id,
+          userId,
+          role: 'member',
+        });
 
-      const p2 = this.participantRepo.create({
-        conversationId: savedConversation.id,
-        userId: targetUserId,
-        role: 'member',
-      });
+        const p2 = this.participantRepo.create({
+          conversationId: saved.id,
+          userId: targetUserId,
+          role: 'member',
+        });
 
-      await queryRunner.manager.save([p1, p2]);
-      await queryRunner.commitTransaction();
+        await manager.save([p1, p2]);
+        return saved;
+      });
 
       // Return fully loaded conversation matching getConversationsForUser structure
       return this.loadConversationWithParticipants(savedConversation.id);
     } catch (err) {
-      await queryRunner.rollbackTransaction();
-
       // Unique violation on direct_key (Postgres error code 23505) means a
       // concurrent request already created this conversation — return it instead.
+      // (withTransaction already rolled the transaction back and rethrew; we
+      // only inspect the error here to pick the fallback path.)
       if ((err.driverError?.code ?? err.code) === '23505') {
         const existingConversation = await this.conversationRepo.findOne({
           where: { directKey },
@@ -405,8 +425,6 @@ export class ConversationsService {
         }
       }
       throw err;
-    } finally {
-      await queryRunner.release();
     }
   }
 }

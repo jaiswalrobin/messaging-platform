@@ -48,6 +48,17 @@ export const MAX_MESSAGE_LENGTH = 4000;
 export const getInternalApiKey = (): string =>
   process.env.INTERNAL_API_KEY ?? 'dev-internal-key';
 
+/**
+ * CORS config shared by both apps so the origin/credentials policy can't drift.
+ * `CORS_ORIGIN` is a comma-separated allowlist; unset means allow all origins.
+ */
+export function getCorsConfig() {
+  return {
+    origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : true,
+    credentials: true,
+  };
+}
+
 // ── Kafka event payloads ──────────────────────────────────────────────────────
 
 export interface KafkaMessageSentPayload {

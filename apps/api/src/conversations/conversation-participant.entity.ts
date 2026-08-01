@@ -9,6 +9,9 @@ import {
 import { Conversation } from './conversation.entity';
 import { User } from '../users/user.entity';
 
+/** Role of a participant within a conversation. */
+export type ParticipantRole = 'admin' | 'member';
+
 @Entity('conversation_participants')
 export class ConversationParticipant {
   @PrimaryColumn('uuid', { name: 'conversation_id' })
@@ -18,7 +21,7 @@ export class ConversationParticipant {
   userId: string;
 
   @Column({ default: 'member' })
-  role: string;
+  role: ParticipantRole;
 
   @CreateDateColumn({ name: 'joined_at' })
   joinedAt: Date;

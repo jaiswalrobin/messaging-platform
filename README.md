@@ -13,7 +13,7 @@ A WhatsApp/Discord-style real-time chat backend — a pnpm + Turborepo monorepo 
 
 ## Prerequisites
 
-- Node.js ≥ 18
+- Node.js ≥ 23.6
 - [pnpm](https://pnpm.io/installation) 9
 - A Docker engine + compose (e.g. [colima](https://github.com/abiosoft/colima) + `docker-compose`, or Docker Desktop)
 
@@ -84,8 +84,6 @@ apps/
   chat-gateway/   WebSocket + HTTP gateway (port 8080)
 packages/
   shared-types/   @chat/shared-types — types + shared runtime config
-  eslint-config/  shared ESLint config
-  typescript-config/  shared TS config
 docker-compose.yml   postgres 15, redis 7, cassandra 4.1
 ARCHITECTURE.md      exhaustive architecture reference
 ```

@@ -1,0 +1,12 @@
+# Exclude entire directories
+/node_modules/
+/build/
+/secret_keys_folder/
+
+# Exclude specific files
+config.json
+.env
+
+# Exclude file types by extension
+*.log
+*.csv

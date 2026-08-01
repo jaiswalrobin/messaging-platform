@@ -1,12 +1,11 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { User } from './user.entity';
-import { UsersService } from './users.service';
-import { UsersController } from './users.controller';
 
 @Module({
   imports: [TypeOrmModule.forFeature([User])],
-  controllers: [UsersController],
-  providers: [UsersService],
+  // Must export the repo registration: HttpJwtGuard (used by MessagesController,
+  // which imports this module) injects Repository<User>.
+  exports: [TypeOrmModule],
 })
 export class UsersModule {}

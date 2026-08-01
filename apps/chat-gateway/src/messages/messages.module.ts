@@ -4,6 +4,7 @@ import { getJwtSecret, JWT_EXPIRES_IN } from '@chat/shared-types';
 import { CassandraService } from './cassandra.service';
 import { MessagesController } from './messages.controller';
 import { ParticipantsModule } from '../participants/participants.module';
+import { UsersModule } from '../users/users.module';
 
 @Module({
   imports: [
@@ -12,6 +13,8 @@ import { ParticipantsModule } from '../participants/participants.module';
       signOptions: { expiresIn: JWT_EXPIRES_IN },
     }),
     ParticipantsModule,
+    // Provides the User mirror repository that HttpJwtGuard re-validates against
+    UsersModule,
   ],
   controllers: [MessagesController],
   providers: [CassandraService],

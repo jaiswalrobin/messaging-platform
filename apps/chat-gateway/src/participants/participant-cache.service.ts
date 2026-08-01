@@ -6,6 +6,10 @@ import { ConversationParticipant } from './conversation-participant.entity';
 
 const CACHE_TTL_SECONDS = 300; // 5 minutes
 
+/** Redis key for a conversation's cached participant list. */
+const participantsCacheKey = (conversationId: string): string =>
+  `conversation:${conversationId}:participants`;
+
 @Injectable()
 export class ParticipantCacheService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(ParticipantCacheService.name);
@@ -45,7 +49,7 @@ export class ParticipantCacheService implements OnModuleInit, OnModuleDestroy {
    * Redis is a best-effort cache: any Redis failure falls through to Postgres.
    */
   async getParticipants(conversationId: string): Promise<string[]> {
-    const cacheKey = `conversation:${conversationId}:participants`;
+    const cacheKey = participantsCacheKey(conversationId);
 
     // 1. Try cache — never let a cache failure break the hot path
     try {
@@ -86,7 +90,7 @@ export class ParticipantCacheService implements OnModuleInit, OnModuleDestroy {
   /** Call when a participant is added/removed (from the api side). */
   async invalidate(conversationId: string): Promise<void> {
     try {
-      await this.redis.del(`conversation:${conversationId}:participants`);
+      await this.redis.del(participantsCacheKey(conversationId));
       this.logger.log(`🗑️  Cache invalidated for ${conversationId}`);
     } catch (err) {
       this.logger.warn(`⚠️ Cache invalidate failed (non-fatal): ${(err as Error).message}`);
