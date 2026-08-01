@@ -8,7 +8,7 @@ import { IsString, IsNotEmpty } from 'class-validator';
  * sender's gray ✓✓ only appears on genuine end-to-end delivery (not when the
  * socket happens to be open but the browser is throttled/offline).
  */
-export class AckDeliveredDto {
+export class MessageDeliveredDto {
   @IsString()
   @IsNotEmpty()
   conversationId: string;

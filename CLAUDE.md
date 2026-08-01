@@ -23,19 +23,21 @@ Each store has exactly one owner; the other service never writes it directly:
 - **Redis 7** — gateway's best-effort cache (participant lists, 5-min TTL), fail-open: any Redis failure falls through to Postgres.
 - **Internal endpoints** are guarded by `x-internal-key` (`getInternalApiKey()` from `@chat/shared-types`): api → gateway `POST /internal/participants/:id/invalidate`; gateway → api `POST /internal/conversations/:id/read` (read watermarks). Mirror these patterns for new cross-service calls.
 
-## WS protocol (client ↔ gateway)
+## WS protocol (client ↔ gateway) — Kafka-first
 
-- Client→server: `message {conversationId, content, clientMessageId}`, `fetch_messages {conversationId, limit}`, `mark_read {conversationId, lastReadMessageId}`, `ack_delivered {conversationId, messageId}`.
-- Server→client: `message_sent`, `message_received`, `message_delivered {messageId, conversationId, clientMessageId, deliveredCount}` (to sender), `message_read {conversationId, readerId, lastReadMessageId, readAt}`, `messages_history`, `error {code: FORBIDDEN|PERSIST_FAILED, ...}`.
+- Client→server: `message {conversationId, content, clientMessageId}`, `fetch_messages {conversationId, limit?}` (DTO-capped 1–100), `mark_read {conversationId, lastReadMessageId}`, `message_delivered {conversationId, messageId}` (delivery ack — renamed from the old `ack_delivered`).
+- Server→client: `message_sent {messageId, conversationId, clientMessageId, status:'sent'}` (to sender), `message_received {messageId, conversationId, senderId, content, createdAt}` (to recipients), `message_delivered {messageId, conversationId, recipientId, deliveredAt, status:'delivered'}` (to everyone but the acker — the FE matches its **own** messages by `messageId`, or `clientMessageId` in direct-fallback mode), `message_read {conversationId, readerId, lastReadMessageId, readAt, status:'read'}` (to everyone but the reader), `messages_history`, `error {code: FORBIDDEN|PERSIST_FAILED|FETCH_FAILED|INTERNAL, ...}` (`PERSIST_FAILED` is direct-fallback mode only).
 - Auth: JWT in `?token=` query param, verified in `handleConnection` (close 1008 on failure); `WsAuthGuard` checks `client.user` exists.
-- Every message handler: **membership check first** (`participantCache.isMember`) — IDOR prevention.
-- Read receipts: `mark_read` → gateway persists via api internal endpoint (monotonic watermark on `conversation_participants.last_read_message_id`, advanced by comparing v1 timeuuid timestamps) → fans out `message_read` to other participants. Persistence is best-effort; stale receipts (`advanced: false`) never fan out. Watermarks are exposed per participant on `GET /conversations` so clients can hydrate blue ticks for messages read while they were offline; live `message_read` keeps them current.
-- Delivery receipts: **ack-driven, app-level** — "delivered" means the recipient's app processed the frame, not merely that its socket was open (a throttled/DevTools-offline browser keeps its socket OPEN, so fan-out is NOT delivery). The recipient's client sends `ack_delivered {conversationId, messageId}` after processing `message_received`; the gateway routes `message_delivered {messageId, conversationId, clientMessageId, deliveredCount}` to the original sender from a short-lived in-memory tracker (messageId → sender + clientMessageId, 60s TTL, per-recipient dedup). Sender-side tick upgrade is monotonic (never downgrades read). No queue for offline senders yet — history re-fetch re-derives 'delivered'.
+- Every handler: **membership check first** (`participantCache.isMember`) — IDOR prevention.
+- **Kafka-first pipeline**: `message` → gateway publishes `MESSAGE_SENT` to `chat-events` (idempotent producer) → **broker ACK ⇒ `message_sent` to sender (one tick)** → the gateway's own consumer (MSS role, `chat-gateway-group`) persists to Cassandra and fans out `message_received`. Broker down → direct persist-and-deliver fallback (sends work; receipts are dead).
+- Delivery receipts (gray ✓✓): the recipient's client sends `message_delivered {conversationId, messageId}` only after actually processing the frame (app-level ack — a throttled/DevTools-offline browser never acks) → consumer persists to `message_receipts` (deduped read-before-write) → broadcasts `message_delivered` to everyone but the acker. Sender-side upgrade is monotonic (never downgrades read).
+- Read receipts (blue ✓✓): `mark_read` → consumer persists to Cassandra `message_receipts` **and** advances the api's Postgres watermark best-effort (`POST /internal/conversations/:id/read`, monotonic CAS by v1 timeuuid compare) → broadcasts `message_read` only when the watermark advanced (`advanced: false` never fans out). Watermarks on `GET /conversations` hydrate blue ticks on reload.
+- Exactly-once is **at-least-once + idempotency**: Cassandra PK-INSERTs are idempotent, the producer is idempotent, the FE dedupes `message_received` by messageId, and the consumer runs a bounded blocking retry (3×) that **never rethrows** (rethrow would drive kafkajs's batch retrier and crash the consumer). After 3 failures an event is skipped loudly (no DLQ yet).
 
 ## Dev workflow
 
 ```bash
-docker compose up -d          # postgres 15 + redis 7 + cassandra 4.1
+docker compose up -d          # postgres 15 + redis 7 + cassandra 4.1 + kafka 3.9 (KRaft)
 pnpm dev                      # runs api + chat-gateway via turbo
 pnpm --filter api build       # type-check one service (nest build)
 ```

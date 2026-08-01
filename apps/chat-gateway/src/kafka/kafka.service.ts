@@ -35,7 +35,16 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
     });
 
     this.admin = this.kafka.admin();
-    this.producer = this.kafka.producer();
+    // Idempotent producer: broker-level dedup (PID + sequence) so producer
+    // retries can't duplicate events. kafkajs forces acks=all internally when
+    // idempotent; maxInFlightRequests=1 is required by idempotence. The
+    // Kafka-level retry config above still applies (bounded — kafkajs warns
+    // "Limiting retries for the idempotent producer", which is intentional so
+    // boot stays fail-soft).
+    this.producer = this.kafka.producer({
+      idempotent: true,
+      maxInFlightRequests: 1,
+    });
     this.consumer = this.kafka.consumer({ groupId: 'chat-gateway-group' });
 
     try {
@@ -57,16 +66,45 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
       await this.consumer.connect();
       await this.consumer.subscribe({ topic: KAFKA_CHAT_TOPIC, fromBeginning: false });
 
-      // Start consuming in background
+      // Start consuming in background.
+      //
+      // Bounded blocking retry, NEVER rethrow: rethrowing drives kafkajs's
+      // batch retrier → KafkaJSNumberOfRetriesExceeded → the consumer crashes
+      // (the retry counter never resets, kafkajs #1592). Blocking sleeps
+      // preserve per-partition ordering (the same partition stalls while we
+      // retry) and stay well under the 30s session timeout. After 3 attempts
+      // the event is skipped LOUDLY (offset advances via auto-commit) — a
+      // deliberate "no DLQ yet" trade-off, never a silent drop.
       await this.consumer.run({
         eachMessage: async ({ message }: { message: KafkaMessage }) => {
           if (!message.value) return;
+
+          let event: KafkaChatEvent;
           try {
-            const event: KafkaChatEvent = JSON.parse(message.value.toString());
-            await Promise.all(this.handlers.map((h) => h(event)));
+            event = JSON.parse(message.value.toString()) as KafkaChatEvent;
           } catch (err) {
-            this.logger.error('❌ Failed to process Kafka event', err);
+            this.logger.error('❌ Malformed Kafka message — skipping', err);
+            return;
           }
+
+          const MAX_ATTEMPTS = 3;
+          for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            try {
+              await Promise.all(this.handlers.map((h) => h(event)));
+              return;
+            } catch (err) {
+              this.logger.error(
+                `❌ Kafka event ${event.type} processing failed (attempt ${attempt}/${MAX_ATTEMPTS}): ${(err as Error).message}`,
+              );
+              if (attempt < MAX_ATTEMPTS) {
+                await new Promise((r) => setTimeout(r, 500 * attempt));
+              }
+            }
+          }
+
+          this.logger.error(
+            `⚠️  Giving up on ${event.type} after ${MAX_ATTEMPTS} attempts — skipping (DLQ deferred)`,
+          );
         },
       });
 
