@@ -36,3 +36,7 @@ yarn-error.log*
 # Misc
 .DS_Store
 *.pem
+
+# Architecture design notes — private, NEVER commit (see CLAUDE.md)
+ARCHITECTURE.md
+arch*.md

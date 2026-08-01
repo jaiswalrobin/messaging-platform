@@ -19,6 +19,9 @@ export class Conversation {
   @Column({ default: 'direct' })
   type: string;
 
+  @Column({ name: 'direct_key', type: 'varchar', nullable: true, unique: true })
+  directKey: string | null;
+
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 

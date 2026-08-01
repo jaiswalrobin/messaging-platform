@@ -1,159 +1,99 @@
-# Turborepo starter
+# Messaging Platform
 
-This Turborepo starter is maintained by the Turborepo core team.
+A WhatsApp/Discord-style real-time chat backend — a pnpm + Turborepo monorepo with two NestJS services.
 
-## Using this example
+| Service | Port | Protocol | Responsibility |
+|---|---|---|---|
+| `apps/api` | 3000 | HTTP (REST) | Auth, JWT, user search, conversation & group management |
+| `apps/chat-gateway` | 8080 | HTTP + WebSocket | Live connections, message persistence (Cassandra), routing, fan-out, delivery receipts, history |
 
-Run the following command:
+**Data stores:** PostgreSQL 15 (metadata) · Cassandra 4.1 (messages) · Redis 7 (participant cache).
 
-```sh
-npx create-turbo@latest
+> Full technical reference: [ARCHITECTURE.md](ARCHITECTURE.md)
+
+## Prerequisites
+
+- Node.js ≥ 18
+- [pnpm](https://pnpm.io/installation) 9
+- A Docker engine + compose (e.g. [colima](https://github.com/abiosoft/colima) + `docker-compose`, or Docker Desktop)
+
+## Quickstart
+
+```bash
+# 1. Install dependencies
+pnpm install
+
+# 2. Start the databases (postgres, redis, cassandra)
+docker compose up -d
+
+# 3. Start both apps
+pnpm dev
 ```
 
-## What's inside?
+Environment is optional in dev (defaults match `docker-compose.yml`); see [.env.example](.env.example) for all variables. **In any real deployment, set `JWT_SECRET`** — both apps must share the same value.
 
-This Turborepo includes the following packages/apps:
+## Docker services control
 
-### Apps and Packages
+Run from the repo root (where `docker-compose.yml` lives):
 
-- `docs`: a [Next.js](https://nextjs.org/) app
-- `web`: another [Next.js](https://nextjs.org/) app
-- `@repo/ui`: a stub React component library shared by both `web` and `docs` applications
-- `@repo/eslint-config`: `eslint` configurations (includes `eslint-config-next` and `eslint-config-prettier`)
-- `@repo/typescript-config`: `tsconfig.json`s used throughout the monorepo
+```bash
+# START the databases (pulls images on first run, then starts + waits for health)
+docker compose up -d
 
-Each package/app is 100% [TypeScript](https://www.typescriptlang.org/).
+# STOP the containers but keep them (fast restart later)
+docker compose stop
+docker compose start          # start them again
 
-### Utilities
+# FULL STOP + remove containers (volumes kept → data survives)
+docker compose down
+# FULL STOP + remove containers AND wipe all data (postgres/cassandra volumes)
+docker compose down -v
 
-This Turborepo has some additional tools already setup for you:
-
-- [TypeScript](https://www.typescriptlang.org/) for static type checking
-- [ESLint](https://eslint.org/) for code linting
-- [Prettier](https://prettier.io) for code formatting
-
-### Build
-
-To build all apps and packages, run the following command:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
-
-```sh
-cd my-turborepo
-turbo build
+# status / health
+docker compose ps
 ```
 
-Without global `turbo`, use your package manager:
+**The engine is separate from the stack** — with colima:
 
-```sh
-cd my-turborepo
-npx turbo build
-pnpm dlx turbo build
-pnpm exec turbo build
+```bash
+colima start     # boots the Linux VM the containers run in
+colima stop      # shuts the VM down (frees RAM/CPU)
+colima status
 ```
 
-You can build a specific package by using a [filter](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters):
+Full sequence: `colima start` → `docker compose up -d` → `pnpm dev`.
 
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
+These commands control **infrastructure only** — the apps run separately via `pnpm dev`.
 
-```sh
-turbo build --filter=docs
+## Testing the services
+
+```bash
+# Verify infra is up
+docker compose ps
+curl -s localhost:3000/health   # api
+curl -s localhost:8080/health   # chat-gateway
 ```
 
-Without global `turbo`:
+A full end-to-end walkthrough (register users → create group → WebSocket chat → history) lives in [ARCHITECTURE.md §18](ARCHITECTURE.md#18-testing-guide).
 
-```sh
-npx turbo build --filter=docs
-pnpm exec turbo build --filter=docs
-pnpm exec turbo build --filter=docs
+## Repo layout
+
+```
+apps/
+  api/            REST service (port 3000)
+  chat-gateway/   WebSocket + HTTP gateway (port 8080)
+packages/
+  shared-types/   @chat/shared-types — types + shared runtime config
+  eslint-config/  shared ESLint config
+  typescript-config/  shared TS config
+docker-compose.yml   postgres 15, redis 7, cassandra 4.1
+ARCHITECTURE.md      exhaustive architecture reference
 ```
 
-### Develop
+## Useful commands
 
-To develop all apps and packages, run the following command:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
-
-```sh
-cd my-turborepo
-turbo dev
+```bash
+pnpm build        # build all apps
+pnpm dev          # run all apps in watch mode
+pnpm lint         # lint
 ```
-
-Without global `turbo`, use your package manager:
-
-```sh
-cd my-turborepo
-npx turbo dev
-pnpm exec turbo dev
-pnpm exec turbo dev
-```
-
-You can develop a specific package by using a [filter](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters):
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
-
-```sh
-turbo dev --filter=web
-```
-
-Without global `turbo`:
-
-```sh
-npx turbo dev --filter=web
-pnpm exec turbo dev --filter=web
-pnpm exec turbo dev --filter=web
-```
-
-### Remote Caching
-
-> [!TIP]
-> Vercel Remote Cache is free for all plans. Get started today at [vercel.com](https://vercel.com/signup?utm_source=remote-cache-sdk&utm_campaign=free_remote_cache).
-
-Turborepo can use a technique known as [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching) to share cache artifacts across machines, enabling you to share build caches with your team and CI/CD pipelines.
-
-By default, Turborepo will cache locally. To enable Remote Caching you will need an account with Vercel. If you don't have an account you can [create one](https://vercel.com/signup?utm_source=turborepo-examples), then enter the following commands:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed (recommended):
-
-```sh
-cd my-turborepo
-turbo login
-```
-
-Without global `turbo`, use your package manager:
-
-```sh
-cd my-turborepo
-npx turbo login
-pnpm exec turbo login
-pnpm exec turbo login
-```
-
-This will authenticate the Turborepo CLI with your [Vercel account](https://vercel.com/docs/concepts/personal-accounts/overview).
-
-Next, you can link your Turborepo to your Remote Cache by running the following command from the root of your Turborepo:
-
-With [global `turbo`](https://turborepo.dev/docs/getting-started/installation#global-installation) installed:
-
-```sh
-turbo link
-```
-
-Without global `turbo`:
-
-```sh
-npx turbo link
-pnpm exec turbo link
-pnpm exec turbo link
-```
-
-## Useful Links
-
-Learn more about the power of Turborepo:
-
-- [Tasks](https://turborepo.dev/docs/crafting-your-repository/running-tasks)
-- [Caching](https://turborepo.dev/docs/crafting-your-repository/caching)
-- [Remote Caching](https://turborepo.dev/docs/core-concepts/remote-caching)
-- [Filtering](https://turborepo.dev/docs/crafting-your-repository/running-tasks#using-filters)
-- [Configuration Options](https://turborepo.dev/docs/reference/configuration)
-- [CLI Usage](https://turborepo.dev/docs/reference/command-line-reference)

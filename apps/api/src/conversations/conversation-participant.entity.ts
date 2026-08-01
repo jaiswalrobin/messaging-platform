@@ -23,6 +23,10 @@ export class ConversationParticipant {
   @CreateDateColumn({ name: 'joined_at' })
   joinedAt: Date;
 
+  /** Read-receipt watermark: highest message id this participant has read (null = never read). */
+  @Column({ name: 'last_read_message_id', type: 'uuid', nullable: true })
+  lastReadMessageId: string | null;
+
   @ManyToOne(() => Conversation, (c) => c.participants)
   @JoinColumn({ name: 'conversation_id' })
   conversation: Conversation;

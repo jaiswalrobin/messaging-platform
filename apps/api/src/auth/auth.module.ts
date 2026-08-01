@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { JwtModule } from '@nestjs/jwt';
 import { PassportModule } from '@nestjs/passport';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { getJwtSecret, JWT_EXPIRES_IN } from '@chat/shared-types';
 import { AuthService } from './auth.service';
 import { AuthController } from './auth.controller';
 import { User } from '../users/user.entity';
@@ -12,9 +13,8 @@ import { JwtStrategy } from './jwt.strategy';
     PassportModule,
     TypeOrmModule.forFeature([User]),
     JwtModule.register({
-      // In production, use process.env.JWT_SECRET and process.env.JWT_EXPIRATION
-      secret: 'super-secret-key-for-local-dev-only', 
-      signOptions: { expiresIn: '7d' },
+      secret: getJwtSecret(),
+      signOptions: { expiresIn: JWT_EXPIRES_IN },
     }),
   ],
   controllers: [AuthController],

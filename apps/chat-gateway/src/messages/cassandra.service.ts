@@ -20,6 +20,13 @@ export class CassandraService implements OnModuleInit, OnModuleDestroy {
     const localDataCenter = process.env.CASSANDRA_LOCAL_DC ?? 'datacenter1';
     this.keyspace = process.env.CASSANDRA_KEYSPACE ?? 'chat_ks';
 
+    // Guard against env-driven CQL injection via CASSANDRA_KEYSPACE
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(this.keyspace)) {
+      throw new Error(
+        `Invalid CASSANDRA_KEYSPACE '${this.keyspace}' — must match /^[A-Za-z_][A-Za-z0-9_]*$/`,
+      );
+    }
+
     // 1. Connect WITHOUT keyspace first, so it doesn't crash if it doesn't exist yet
     this.client = new Client({
       contactPoints,
@@ -28,8 +35,23 @@ export class CassandraService implements OnModuleInit, OnModuleDestroy {
 
     this.logger.log(`Connecting to Cassandra at ${contactPoints.join(',')}`);
 
-    // 2. Create keyspace and tables
-    await this.initSchema();
+    // 2. Create keyspace and tables, retrying while Cassandra finishes booting.
+    // Fail fast after 10 attempts — the gateway is useless without message storage.
+    const maxAttempts = 10;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        await this.initSchema();
+        break;
+      } catch (err) {
+        this.logger.error(
+          `Cassandra init failed (attempt ${attempt}/${maxAttempts}): ${(err as Error).message}`,
+        );
+        if (attempt === maxAttempts) {
+          throw err;
+        }
+        await new Promise((r) => setTimeout(r, 3000));
+      }
+    }
 
     this.logger.log(`✅ Cassandra keyspace '${this.keyspace}' and tables initialized`);
   }
