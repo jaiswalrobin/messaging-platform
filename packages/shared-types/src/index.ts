@@ -48,28 +48,7 @@ export const MAX_MESSAGE_LENGTH = 4000;
 export const getInternalApiKey = (): string =>
   process.env.INTERNAL_API_KEY ?? 'dev-internal-key';
 
-export interface SendMessagePayload {
-  conversationId: string;
-  content: string;
-  clientMessageId: string;
-}
-
-export interface MarkReadPayload {
-  conversationId: string;
-  lastReadMessageId: string;
-}
-
-export interface MessageDeliveredPayload {
-  conversationId: string;
-  messageId: string;
-  clientMessageId?: string;
-}
-
-export type MessageStatus = 'sending' | 'sent' | 'delivered' | 'read';
-
 // ── Kafka event payloads ──────────────────────────────────────────────────────
-
-export type KafkaEventType = 'MESSAGE_SENT' | 'MESSAGE_DELIVERED' | 'MESSAGE_READ';
 
 export interface KafkaMessageSentPayload {
   type: 'MESSAGE_SENT';
