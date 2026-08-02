@@ -11,10 +11,12 @@ async function bootstrap() {
 
   app.useGlobalFilters(new HttpExceptionFilter(app.get(HttpAdapterHost)));
 
-  app.useGlobalPipes(new ValidationPipe({
-    whitelist: true,      // strips any extra fields the client sends that aren't in the DTO
-    transform: true,      // transforms payloads to DTO class instances
-  }));
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true, // strips any extra fields the client sends that aren't in the DTO
+      transform: true, // transforms payloads to DTO class instances
+    }),
+  );
   await app.listen(process.env.PORT ?? 3000);
 }
 bootstrap();

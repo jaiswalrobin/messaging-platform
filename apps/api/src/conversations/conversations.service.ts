@@ -1,7 +1,12 @@
-import { Injectable, ForbiddenException, BadRequestException, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  ForbiddenException,
+  BadRequestException,
+  Logger,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, Repository, EntityManager } from 'typeorm';
-import { getInternalApiKey } from '@chat/shared-types';
+import { getInternalApiKey, MAX_HISTORY_LIMIT } from '@chat/shared-types';
 import { ConversationParticipant } from './conversation-participant.entity';
 import { Conversation } from './conversation.entity';
 import { User } from '../users/user.entity';
@@ -94,7 +99,11 @@ export class ConversationsService {
       relations: { conversation: true },
     });
 
-    if (!participant || participant.role !== 'admin' || participant.conversation.type !== 'group') {
+    if (
+      !participant ||
+      participant.role !== 'admin' ||
+      participant.conversation.type !== 'group'
+    ) {
       return null;
     }
 
@@ -102,33 +111,59 @@ export class ConversationsService {
   }
 
   private async findMissingUserIds(userIds: string[]): Promise<string[]> {
-    const existing = await this.userRepo.find({
-      where: { id: In(userIds) },
-      select: { id: true },
-    });
-    const existingIds = new Set(existing.map((u) => u.id));
-    return [...new Set(userIds)].filter((id) => !existingIds.has(id));
+    // Chunk the IN(...) so a huge participant list can't exceed Postgres's
+    // bound-parameter limit or bloat a single query.
+    const CHUNK_SIZE = 1000;
+    const uniqueIds = [...new Set(userIds)];
+    const existingIds = new Set<string>();
+    for (let i = 0; i < uniqueIds.length; i += CHUNK_SIZE) {
+      const chunk = uniqueIds.slice(i, i + CHUNK_SIZE);
+      const existing = await this.userRepo.find({
+        where: { id: In(chunk) },
+        select: { id: true },
+      });
+      for (const user of existing) existingIds.add(user.id);
+    }
+    return uniqueIds.filter((id) => !existingIds.has(id));
   }
 
-  async getConversationsForUser(userId: string) {
+  async getConversationsForUser(
+    userId: string,
+    limit?: number,
+    offset?: number,
+  ) {
+    const safeLimit =
+      limit && !isNaN(limit) && limit > 0
+        ? Math.min(limit, MAX_HISTORY_LIMIT)
+        : undefined;
+    const safeOffset =
+      offset && !isNaN(offset) && offset >= 0 ? offset : undefined;
+
     // Find all conversation IDs where this user is a participant
     const participations = await this.participantRepo.find({
       where: { userId },
       relations: { conversation: true },
+      ...(safeLimit !== undefined ? { take: safeLimit } : {}),
+      ...(safeOffset !== undefined ? { skip: safeOffset } : {}),
     });
 
     // Fetch participants for all conversations in one query
     const conversationIds = participations.map((p) => p.conversation.id);
-    const allParticipants = conversationIds.length > 0
-      ? await this.participantRepo.find({
-          where: { conversationId: In(conversationIds) },
-          relations: { user: true },
-        })
-      : [];
+    const allParticipants =
+      conversationIds.length > 0
+        ? await this.participantRepo.find({
+            where: { conversationId: In(conversationIds) },
+            relations: { user: true },
+          })
+        : [];
 
-    const participantsByConversation = new Map<string, ConversationParticipant[]>();
+    const participantsByConversation = new Map<
+      string,
+      ConversationParticipant[]
+    >();
     for (const participant of allParticipants) {
-      const list = participantsByConversation.get(participant.conversationId) ?? [];
+      const list =
+        participantsByConversation.get(participant.conversationId) ?? [];
       list.push(participant);
       participantsByConversation.set(participant.conversationId, list);
     }
@@ -148,7 +183,8 @@ export class ConversationsService {
   private async withTransaction<T>(
     fn: (manager: EntityManager) => Promise<T>,
   ): Promise<T> {
-    const queryRunner = this.conversationRepo.manager.connection.createQueryRunner();
+    const queryRunner =
+      this.conversationRepo.manager.connection.createQueryRunner();
     await queryRunner.connect();
     await queryRunner.startTransaction();
 
@@ -164,7 +200,11 @@ export class ConversationsService {
     }
   }
 
-  async createGroup(creatorId: string, title: string, participantIds: string[]) {
+  async createGroup(
+    creatorId: string,
+    title: string,
+    participantIds: string[],
+  ) {
     const savedConversation = await this.withTransaction(async (manager) => {
       // 1. Create the conversation
       const conversation = this.conversationRepo.create({
@@ -184,7 +224,9 @@ export class ConversationsService {
       // 3. Verify all participant IDs exist before inserting them
       const missingIds = await this.findMissingUserIds(participantIds);
       if (missingIds.length > 0) {
-        throw new BadRequestException('One or more participant IDs do not exist');
+        throw new BadRequestException(
+          'One or more participant IDs do not exist',
+        );
       }
 
       // 4. Create other participants as members (deduped so duplicate
@@ -207,7 +249,11 @@ export class ConversationsService {
     return this.loadConversationWithParticipants(savedConversation.id);
   }
 
-  async updateGroupTitle(userId: string, conversationId: string, title: string) {
+  async updateGroupTitle(
+    userId: string,
+    conversationId: string,
+    title: string,
+  ) {
     const participant = await this.findGroupAdmin(userId, conversationId);
 
     if (!participant) {
@@ -222,7 +268,11 @@ export class ConversationsService {
     return (await this.loadConversationWithParticipants(conversationId))!;
   }
 
-  async addGroupParticipants(userId: string, conversationId: string, participantIds: string[]) {
+  async addGroupParticipants(
+    userId: string,
+    conversationId: string,
+    participantIds: string[],
+  ) {
     const adminParticipant = await this.findGroupAdmin(userId, conversationId);
 
     if (!adminParticipant) {
@@ -238,36 +288,48 @@ export class ConversationsService {
     });
     const existingIds = new Set(existingParticipants.map((p) => p.userId));
 
-    const newParticipants = uniqueParticipantIds
-      .filter((id) => !existingIds.has(id))
-      .map((id) =>
+    // Filter once to the id list; entities are only wrapped after validation
+    // survives, so we never map to entities and immediately re-unwrap them.
+    const newParticipantIds = uniqueParticipantIds.filter(
+      (id) => !existingIds.has(id),
+    );
+
+    // Verify the new participant IDs actually exist
+    const invalidIds =
+      newParticipantIds.length > 0
+        ? await this.findMissingUserIds(newParticipantIds)
+        : [];
+    if (invalidIds.length > 0) {
+      throw new BadRequestException(
+        `One or more participant IDs do not exist: ${invalidIds.join(', ')}`,
+      );
+    }
+
+    if (newParticipantIds.length > 0) {
+      const newParticipants = newParticipantIds.map((id) =>
         this.participantRepo.create({
           conversationId,
           userId: id,
           role: 'member',
         }),
       );
-
-    // Verify the new participant IDs actually exist
-    const newParticipantIds = newParticipants.map((p) => p.userId);
-    const invalidIds = newParticipantIds.length > 0
-      ? await this.findMissingUserIds(newParticipantIds)
-      : [];
-    if (invalidIds.length > 0) {
-      throw new BadRequestException(`One or more participant IDs do not exist: ${invalidIds.join(', ')}`);
-    }
-
-    if (newParticipants.length > 0) {
-      await this.participantRepo.save(newParticipants);
+      await this.withTransaction(async (manager) => {
+        await manager.save(newParticipants);
+      });
 
       // Best-effort invalidation of the gateway's participant cache — never fail the request.
       try {
-        await fetch(`http://${process.env.GATEWAY_URL ?? 'localhost:8080'}/internal/participants/${conversationId}/invalidate`, {
-          method: 'POST',
-          headers: { 'x-internal-key': getInternalApiKey() },
-        });
+        await fetch(
+          `http://${process.env.GATEWAY_URL ?? 'localhost:8080'}/internal/participants/${conversationId}/invalidate`,
+          {
+            method: 'POST',
+            headers: { 'x-internal-key': getInternalApiKey() },
+          },
+        );
       } catch (err) {
-        this.logger.warn(`⚠️ Gateway invalidation failed (non-fatal): ${(err as Error).message}`);
+        this.logger.warn(
+          `⚠️ Gateway invalidation failed (non-fatal): ${(err as Error).message}`,
+        );
       }
     }
 
@@ -294,6 +356,16 @@ export class ConversationsService {
     userId: string,
     lastReadMessageId: string,
   ): Promise<{ advanced: boolean }> {
+    // The watermark must be a canonical v1 timeuuid — reject anything else up
+    // front (garbage would 22P02 on Postgres's uuid cast and NaN the compares).
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-6][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        lastReadMessageId,
+      )
+    ) {
+      throw new BadRequestException('Invalid lastReadMessageId');
+    }
+
     // Select the PK columns alongside the watermark. TypeORM hydrates a row as
     // non-existent when EVERY projected column comes back NULL — so a `select`
     // of only the nullable `lastReadMessageId` returns null on the first read
@@ -319,13 +391,49 @@ export class ConversationsService {
         .andWhere('user_id = :userId', { userId })
         .andWhere('last_read_message_id IS NULL')
         .execute();
-      return { advanced: (result.affected ?? 0) > 0 };
+
+      const advanced = (result.affected ?? 0) > 0;
+      if (!advanced) {
+        const current = await this.participantRepo.findOne({
+          where: { conversationId, userId },
+          select: { lastReadMessageId: true },
+        });
+        if (
+          current?.lastReadMessageId &&
+          uuidV1Timestamp(current.lastReadMessageId) >=
+            uuidV1Timestamp(lastReadMessageId)
+        ) {
+          return { advanced: true };
+        }
+        // CAS lost to a concurrent advance that is still older than the requested
+        // id — retry once against the fresh value so the newer receipt isn't stranded.
+        const retry = await this.participantRepo
+          .createQueryBuilder()
+          .update(ConversationParticipant)
+          .set({ lastReadMessageId })
+          .where('conversation_id = :conversationId', { conversationId })
+          .andWhere('user_id = :userId', { userId })
+          .andWhere(
+            current?.lastReadMessageId
+              ? 'last_read_message_id = :current'
+              : 'last_read_message_id IS NULL',
+            current?.lastReadMessageId
+              ? { current: current.lastReadMessageId }
+              : {},
+          )
+          .execute();
+        return { advanced: (retry.affected ?? 0) > 0 };
+      }
+      return { advanced };
     }
 
     // Only advance if the new receipt is genuinely newer (chronological, not
     // byte-order). Compare-and-swap on the current value so a concurrent
     // advance wins cleanly instead of being clobbered by a stale one.
-    if (uuidV1Timestamp(lastReadMessageId) <= uuidV1Timestamp(existing.lastReadMessageId)) {
+    if (
+      uuidV1Timestamp(lastReadMessageId) <=
+      uuidV1Timestamp(existing.lastReadMessageId)
+    ) {
       this.logger.debug(
         `mark_read no-op for ${userId} in ${conversationId} (stale receipt)`,
       );
@@ -338,52 +446,82 @@ export class ConversationsService {
       .set({ lastReadMessageId })
       .where('conversation_id = :conversationId', { conversationId })
       .andWhere('user_id = :userId', { userId })
-      .andWhere('last_read_message_id = :current', { current: existing.lastReadMessageId })
+      .andWhere('last_read_message_id = :current', {
+        current: existing.lastReadMessageId,
+      })
       .execute();
 
     const advanced = (result.affected ?? 0) > 0;
     if (!advanced) {
-      this.logger.debug(
-        `mark_read no-op for ${userId} in ${conversationId} (race lost to concurrent advance)`,
-      );
+      // Race lost to concurrent advance: re-query current watermark
+      const current = await this.participantRepo.findOne({
+        where: { conversationId, userId },
+        select: { lastReadMessageId: true },
+      });
+
+      if (
+        current?.lastReadMessageId &&
+        uuidV1Timestamp(current.lastReadMessageId) >=
+          uuidV1Timestamp(lastReadMessageId)
+      ) {
+        this.logger.debug(
+          `mark_read for ${userId} in ${conversationId}: race lost, but current watermark ${current.lastReadMessageId} >= ${lastReadMessageId}`,
+        );
+        return { advanced: true };
+      }
+
+      // The concurrent advance was itself stale (still older than the requested
+      // id) — retry once against the fresh value so the newer receipt isn't
+      // stranded. The retry can only fail if another writer moved the watermark
+      // to >= requested in the meantime, keeping advanced=false only when the
+      // stored value is already at-or-newer.
+      //
+      // This is the non-null branch: the watermark is never reset to NULL, so
+      // the re-queried value is non-null too — bind it directly (a vanished row
+      // binds null and simply matches nothing).
+      const retry = await this.participantRepo
+        .createQueryBuilder()
+        .update(ConversationParticipant)
+        .set({ lastReadMessageId })
+        .where('conversation_id = :conversationId', { conversationId })
+        .andWhere('user_id = :userId', { userId })
+        .andWhere('last_read_message_id = :current', {
+          current: current?.lastReadMessageId ?? null,
+        })
+        .execute();
+
+      return { advanced: (retry.affected ?? 0) > 0 };
     }
     return { advanced };
   }
 
   async createDirectConversation(userId: string, targetUserId: string) {
     if (userId === targetUserId) {
-      throw new BadRequestException('Cannot create a direct conversation with yourself');
+      throw new BadRequestException(
+        'Cannot create a direct conversation with yourself',
+      );
     }
 
     // Verify the target user exists before creating anything
-    const targetUser = await this.userRepo.findOne({ where: { id: targetUserId } });
+    const targetUser = await this.userRepo.findOne({
+      where: { id: targetUserId },
+    });
     if (!targetUser) {
       throw new BadRequestException('Target user does not exist');
     }
 
-    // Check if direct conversation already exists.
-    // Table names mirror the entities: `conversations` = Conversation,
-    // `conversation_participants` = ConversationParticipant. We look for a
-    // conversation of type 'direct' where both users are participants.
-    // Note: this assumes direct conversations always have exactly 2 participants
-    const query = `
-      SELECT c.id
-      FROM conversations c
-      JOIN conversation_participants cp1 ON c.id = cp1.conversation_id
-      JOIN conversation_participants cp2 ON c.id = cp2.conversation_id
-      WHERE c.type = 'direct'
-        AND cp1.user_id = $1
-        AND cp2.user_id = $2
-      LIMIT 1
-    `;
-    const existing = await this.conversationRepo.query(query, [userId, targetUserId]);
-
-    if (existing && existing.length > 0) {
-      return this.loadConversationWithParticipants(existing[0].id);
-    }
-
-    // Deterministic key so concurrent creations collide on the unique index
+    // Check if a direct conversation already exists. The deterministic
+    // directKey (sorted `a|b`) is a unique-indexed column, so a single indexed
+    // lookup replaces the old two-table JOIN — concurrent creations still
+    // collide on that unique index (handled below via the 23505 fallback).
     const directKey = [userId, targetUserId].sort().join('|');
+    const existing = await this.conversationRepo.findOne({
+      where: { directKey },
+    });
+
+    if (existing) {
+      return this.loadConversationWithParticipants(existing.id);
+    }
 
     try {
       const savedConversation = await this.withTransaction(async (manager) => {

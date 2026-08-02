@@ -1,7 +1,6 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { getTypeOrmConfig } from '@chat/shared-types';
-import { AppController } from './app.controller';
 import { UsersModule } from './users/users.module';
 import { AuthModule } from './auth/auth.module';
 import { ConversationsModule } from './conversations/conversations.module';
@@ -17,6 +16,6 @@ import { HealthController } from './health/health.controller';
     AuthModule,
     ConversationsModule,
   ],
-  controllers: [AppController, HealthController],
+  controllers: [HealthController],
 })
-export class AppModule { }
+export class AppModule {}

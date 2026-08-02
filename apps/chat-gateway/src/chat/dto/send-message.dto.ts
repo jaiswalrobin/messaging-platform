@@ -1,4 +1,4 @@
-import { IsString, IsNotEmpty, MaxLength } from 'class-validator';
+import { IsString, IsNotEmpty, MaxLength, Matches } from 'class-validator';
 import { MAX_MESSAGE_LENGTH } from '@chat/shared-types';
 
 export class SendMessageDto {
@@ -8,6 +8,7 @@ export class SendMessageDto {
 
   @IsString()
   @IsNotEmpty()
+  @Matches(/\S/, { message: 'content must contain a non-whitespace character' })
   @MaxLength(MAX_MESSAGE_LENGTH)
   content: string;
 

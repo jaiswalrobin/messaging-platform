@@ -9,7 +9,7 @@
  */
 
 /** Options controlling the shared TypeORM postgres connection config. */
-export type DbConfig = { synchronize: boolean };
+type DbConfig = { synchronize: boolean };
 
 /**
  * TypeORM postgres connection config shared by both apps so the connection
@@ -33,8 +33,12 @@ export function getTypeOrmConfig({ synchronize }: DbConfig) {
 }
 
 /** JWT signing/verification secret. MUST be overridden via env in any real deployment. */
-export const getJwtSecret = (): string =>
-  process.env.JWT_SECRET ?? 'super-secret-key-for-local-dev-only';
+export const getJwtSecret = (): string => {
+  if (process.env.NODE_ENV === 'production' && !process.env.JWT_SECRET) {
+    throw new Error('JWT_SECRET environment variable is required in production');
+  }
+  return process.env.JWT_SECRET ?? 'super-secret-key-for-local-dev-only';
+};
 
 export const JWT_EXPIRES_IN = '7d';
 
@@ -45,8 +49,12 @@ export const MAX_HISTORY_LIMIT = 100;
 export const MAX_MESSAGE_LENGTH = 4000;
 
 /** Shared secret for internal gateway endpoints (api → gateway invalidation). */
-export const getInternalApiKey = (): string =>
-  process.env.INTERNAL_API_KEY ?? 'dev-internal-key';
+export const getInternalApiKey = (): string => {
+  if (process.env.NODE_ENV === 'production' && !process.env.INTERNAL_API_KEY) {
+    throw new Error('INTERNAL_API_KEY environment variable is required in production');
+  }
+  return process.env.INTERNAL_API_KEY ?? 'dev-internal-key';
+};
 
 /**
  * CORS config shared by both apps so the origin/credentials policy can't drift.
@@ -69,6 +77,15 @@ export interface KafkaMessageSentPayload {
   content: string;
   clientMessageId: string;
   createdAt: string;
+  /**
+   * Per-connection id of the originating WS socket. Lets the MSS consumer fan
+   * out `message_received` to the sender's OTHER devices without re-sending to
+   * the origin socket (which already got `message_sent` — a second frame would
+   * duplicate the optimistic row if frames reorder). Optional: legacy/queued
+   * events may lack it; the consumer then sends to all the sender's sockets
+   * and relies on the FE's messageId dedupe.
+   */
+  senderSocketId?: string;
 }
 
 export interface KafkaMessageDeliveredPayload {

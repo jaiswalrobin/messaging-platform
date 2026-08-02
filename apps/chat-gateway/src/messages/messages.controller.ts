@@ -34,7 +34,7 @@ export class MessagesController {
       throw new ForbiddenException('Not a member of this conversation');
     }
 
-    const safeLimit = Math.min(limit, MAX_HISTORY_LIMIT);
+    const safeLimit = Math.max(1, Math.min(limit, MAX_HISTORY_LIMIT));
     const messages = await this.cassandraService.getMessages(conversationId, safeLimit);
     return { conversationId, messages };
   }

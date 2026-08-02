@@ -26,7 +26,7 @@ export class HttpExceptionFilter implements ExceptionFilter {
     // Never leak the stack trace (or any internal detail) to the client.
     const message =
       exception instanceof HttpException
-        ? (exception.getResponse() as any).message ?? exception.message
+        ? ((exception.getResponse() as any).message ?? exception.message)
         : 'Internal server error';
 
     this.logger.error(
@@ -36,6 +36,10 @@ export class HttpExceptionFilter implements ExceptionFilter {
 
     // Framework-agnostic reply via the injected adapter — no express `Response`
     // casting needed.
-    httpAdapter.reply(ctx.getResponse(), { statusCode: status, message }, status);
+    httpAdapter.reply(
+      ctx.getResponse(),
+      { statusCode: status, message },
+      status,
+    );
   }
 }

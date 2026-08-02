@@ -1,4 +1,8 @@
-import { Injectable, UnauthorizedException, ConflictException } from '@nestjs/common';
+import {
+  Injectable,
+  UnauthorizedException,
+  ConflictException,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { JwtService } from '@nestjs/jwt';
@@ -15,17 +19,23 @@ export class AuthService {
   ) {}
 
   async register(email: string, password: string): Promise<UserAuthResponse> {
+    // Normalize to lowercase so `User@X.com` and `user@x.com` can't create
+    // duplicate accounts or hijack a conversation lookup.
+    const normalizedEmail = email.trim().toLowerCase();
     const existingUser = await this.userRepository.findOne({
-      where: { email },
+      where: { email: normalizedEmail },
     });
     if (existingUser) {
       throw new ConflictException('User already exists');
     }
 
-    const salt = await bcrypt.genSalt();
-    const passwordHash = await bcrypt.hash(password, salt);
+    // bcrypt auto-generates the salt when given rounds — one async step instead of two.
+    const passwordHash = await bcrypt.hash(password, 10);
 
-    const user = this.userRepository.create({ email, password: passwordHash });
+    const user = this.userRepository.create({
+      email: normalizedEmail,
+      password: passwordHash,
+    });
     const savedUser = await this.userRepository.save(user);
 
     const token = this.generateToken(savedUser);
@@ -34,7 +44,11 @@ export class AuthService {
   }
 
   async login(email: string, password: string): Promise<UserAuthResponse> {
-    const user = await this.userRepository.findOne({ where: { email } });
+    // Match the normalized form used at registration.
+    const normalizedEmail = email.trim().toLowerCase();
+    const user = await this.userRepository.findOne({
+      where: { email: normalizedEmail },
+    });
     if (!user) {
       throw new UnauthorizedException('Invalid credentials');
     }

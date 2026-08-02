@@ -1,4 +1,10 @@
-import { IsString, IsArray, ArrayMinSize, IsNotEmpty, ArrayUnique } from 'class-validator';
+import {
+  IsString,
+  IsArray,
+  ArrayMinSize,
+  IsNotEmpty,
+  ArrayUnique,
+} from 'class-validator';
 
 export class CreateGroupDto {
   @IsString()

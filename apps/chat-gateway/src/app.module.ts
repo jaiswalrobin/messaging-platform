@@ -8,6 +8,7 @@ import { ConnectionRegistryService } from './chat/connection-registry.service';
 import { HealthController } from './health/health.controller';
 import { InvalidateController } from './internal/invalidate.controller';
 import { ApiClientService } from './internal/api-client.service';
+import { UsersModule } from './users/users.module';
 import { MessagesModule } from './messages/messages.module';
 import { ParticipantsModule } from './participants/participants.module';
 import { KafkaModule } from './kafka/kafka.module';
@@ -21,6 +22,7 @@ import { KafkaModule } from './kafka/kafka.module';
       secret: getJwtSecret(),
       signOptions: { expiresIn: JWT_EXPIRES_IN },
     }),
+    UsersModule,
     MessagesModule,
     ParticipantsModule,
     KafkaModule,

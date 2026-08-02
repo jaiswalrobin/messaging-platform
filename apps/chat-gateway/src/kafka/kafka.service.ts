@@ -10,10 +10,14 @@ import {
 import type { KafkaChatEvent } from '@chat/shared-types';
 
 export const KAFKA_CHAT_TOPIC = 'chat-events';
+export const KAFKA_CHAT_DLQ_TOPIC = 'chat-events-dlq';
 
-// Bounded processing attempts per event before it is skipped loudly; see the
-// "never rethrow" comment block in onModuleInit below.
+// Bounded processing attempts per event before it is skipped loudly and published to DLQ; see the
+// "never rethrow" comment block in connectKafka below.
 const MAX_ATTEMPTS = 3;
+
+// Reconnect cadence after a failed boot connect (Issue 19)
+const RETRY_INTERVAL_MS = 15000;
 
 @Injectable()
 export class KafkaService implements OnModuleInit, OnModuleDestroy {
@@ -24,15 +28,35 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
   private admin: Admin;
   private available = false;
 
+  // Broker list retained for reconnect logging
+  private brokers: string[];
+
+  // Issue 19: bounded boot-time reconnect state. The step flags gate each
+  // connectKafka run so a retry never re-subscribes or re-runs an
+  // already-initialized consumer (kafkajs throws on subscribe()/run() twice).
+  private attempts = 0;
+  private retryTimer?: NodeJS.Timeout;
+  private adminConnected = false;
+  private producerConnected = false;
+  private consumerConnected = false;
+  private subscribed = false;
+  private running = false;
+
   // Callbacks registered by other services to consume events
   private handlers: Array<(event: KafkaChatEvent) => Promise<void>> = [];
 
+  // Callbacks invoked on the final-skip path (after MAX_ATTEMPTS + DLQ publish)
+  private skipHandlers: Array<(event: KafkaChatEvent) => Promise<void>> = [];
+
   async onModuleInit(): Promise<void> {
-    const brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092').split(',');
+    this.brokers = (process.env.KAFKA_BROKERS ?? 'localhost:9092')
+      .split(',')
+      .map((b) => b.trim())
+      .filter(Boolean);
 
     this.kafka = new Kafka({
       clientId: 'chat-gateway',
-      brokers,
+      brokers: this.brokers,
       logLevel: logLevel.WARN,
       // Retry / timeout tuning so startup does not block server if Kafka is down
       retry: { retries: 3, initialRetryTime: 300 },
@@ -51,8 +75,40 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
     });
     this.consumer = this.kafka.consumer({ groupId: 'chat-gateway-group' });
 
+    // Issue 19: reconnect on boot failure. connectKafkaWithRetry re-runs the
+    // full sequence every 15s until it succeeds, then flips available and stops.
+    await this.connectKafkaWithRetry();
+  }
+
+  /**
+   * Bounded boot-time reconnect. Never throws — on failure the gateway keeps
+   * serving in direct-delivery mode while a 15s timer retries the connect.
+   */
+  private async connectKafkaWithRetry(): Promise<void> {
     try {
-      // Ensure topic exists
+      await this.connectKafka();
+      this.available = true;
+      this.logger.log(`✅ Kafka connected — broker(s): ${this.brokers.join(', ')}`);
+    } catch (err) {
+      this.attempts++;
+      this.logger.error(
+        `❌ Kafka connect attempt ${this.attempts} failed (${(err as Error).message}) — retrying in ${RETRY_INTERVAL_MS / 1000}s`,
+      );
+      this.retryTimer = setTimeout(() => {
+        void this.connectKafkaWithRetry();
+      }, RETRY_INTERVAL_MS);
+    }
+  }
+
+  /**
+   * Connect + init topics + subscribe + start consuming. Each step is gated by
+   * a flag so the sequence is idempotent across retries: a retry after a
+   * partial success skips already-completed steps (kafkajs throws if
+   * consumer.subscribe() or run() is called twice on the same instance).
+   */
+  private async connectKafka(): Promise<void> {
+    if (!this.adminConnected) {
+      // Ensure topics exist
       await this.admin.connect();
       await this.admin.createTopics({
         waitForLeaders: true,
@@ -62,14 +118,33 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
             numPartitions: 4,
             replicationFactor: 1,
           },
+          {
+            topic: KAFKA_CHAT_DLQ_TOPIC,
+            numPartitions: 4,
+            replicationFactor: 1,
+          },
         ],
       });
       await this.admin.disconnect();
+      this.adminConnected = true;
+    }
 
+    if (!this.producerConnected) {
       await this.producer.connect();
-      await this.consumer.connect();
-      await this.consumer.subscribe({ topic: KAFKA_CHAT_TOPIC, fromBeginning: false });
+      this.producerConnected = true;
+    }
 
+    if (!this.consumerConnected) {
+      await this.consumer.connect();
+      this.consumerConnected = true;
+    }
+
+    if (!this.subscribed) {
+      await this.consumer.subscribe({ topic: KAFKA_CHAT_TOPIC, fromBeginning: false });
+      this.subscribed = true;
+    }
+
+    if (!this.running) {
       // Start consuming in background.
       //
       // Bounded blocking retry, NEVER rethrow: rethrowing drives kafkajs's
@@ -77,8 +152,8 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
       // (the retry counter never resets, kafkajs #1592). Blocking sleeps
       // preserve per-partition ordering (the same partition stalls while we
       // retry) and stay well under the 30s session timeout. After 3 attempts
-      // the event is skipped LOUDLY (offset advances via auto-commit) — a
-      // deliberate "no DLQ yet" trade-off, never a silent drop.
+      // the event is published to DLQ (chat-events-dlq) before skipping — never
+      // a silent drop.
       await this.consumer.run({
         eachMessage: async ({ message }: { message: KafkaMessage }) => {
           if (!message.value) return;
@@ -106,26 +181,62 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
           }
 
           this.logger.error(
-            `⚠️  Giving up on ${event.type} after ${MAX_ATTEMPTS} attempts — skipping (DLQ deferred)`,
+            `⚠️  Giving up on ${event.type} after ${MAX_ATTEMPTS} attempts — publishing to DLQ (${KAFKA_CHAT_DLQ_TOPIC})`,
           );
+          try {
+            await this.producer.send({
+              topic: KAFKA_CHAT_DLQ_TOPIC,
+              messages: [
+                {
+                  key: event.conversationId,
+                  value: JSON.stringify(event),
+                },
+              ],
+            });
+            this.logger.log(`📥 Event ${event.type} published to DLQ (${KAFKA_CHAT_DLQ_TOPIC})`);
+          } catch (dlqErr) {
+            this.logger.error(
+              `❌ Failed to publish event ${event.type} to DLQ (${KAFKA_CHAT_DLQ_TOPIC}): ${(dlqErr as Error).message}`,
+            );
+          }
+
+          // Notify registered skip handlers (e.g. surface PERSIST_FAILED to the
+          // affected sender). A throwing handler must never break the consumer.
+          for (const skipHandler of this.skipHandlers) {
+            try {
+              await skipHandler(event);
+            } catch (skipErr) {
+              this.logger.error(
+                `❌ onEventSkipped handler failed for ${event.type}: ${(skipErr as Error).message}`,
+              );
+            }
+          }
         },
       });
-
-      this.available = true;
-      this.logger.log(`✅ Kafka connected — broker(s): ${brokers.join(', ')}`);
-    } catch (err) {
-      // Non-fatal: chat gateway continues in direct-delivery mode
-      this.logger.warn(`⚠️  Kafka unavailable (${(err as Error).message}) — falling back to direct delivery`);
+      this.running = true;
     }
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.handlers = [];
+    this.skipHandlers = [];
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = undefined;
+    }
     try {
       await this.producer?.disconnect();
       await this.consumer?.disconnect();
     } catch {
       // ignore errors on shutdown
     }
+  }
+
+  /**
+   * Public read of the available flag (used by the health controller).
+   */
+  get isAvailable(): boolean {
+    return this.available;
   }
 
   /**
@@ -156,5 +267,14 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
    */
   onEvent(handler: (event: KafkaChatEvent) => Promise<void>): void {
     this.handlers.push(handler);
+  }
+
+  /**
+   * Register a handler invoked on the final-skip path — an event that exhausted
+   * MAX_ATTEMPTS and was published to the DLQ. Invoked in a try/catch so a
+   * throwing handler can never break the consumer.
+   */
+  onEventSkipped(handler: (event: KafkaChatEvent) => Promise<void>): void {
+    this.skipHandlers.push(handler);
   }
 }

@@ -94,6 +94,25 @@ export class CassandraService implements OnModuleInit, OnModuleDestroy {
     `);
   }
 
+  // ── Liveness ───────────────────────────────────────────────────────────────
+
+  /**
+   * Liveness probe: can we execute a trivial query? Never throws.
+   */
+  async isHealthy(): Promise<boolean> {
+    try {
+      await Promise.race([
+        this.client.execute('SELECT now() FROM system.local'),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Cassandra probe timed out')), 2000),
+        ),
+      ]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   // ── Message Persistence ─────────────────────────────────────────────────────
 
   async saveMessage(

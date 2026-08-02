@@ -83,8 +83,23 @@ export class ParticipantCacheService implements OnModuleInit, OnModuleDestroy {
 
   /** Returns whether the user is a participant in the conversation. */
   async isMember(conversationId: string, userId: string): Promise<boolean> {
-    const count = await this.participantRepo.count({ where: { conversationId, userId } });
-    return count > 0;
+    const participants = await this.getParticipants(conversationId);
+    return participants.includes(userId);
+  }
+
+  /** Best-effort liveness probe: does Redis answer PING? Never throws. */
+  async isHealthy(): Promise<boolean> {
+    try {
+      await Promise.race([
+        this.redis.ping(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Redis PING timed out')), 2000),
+        ),
+      ]);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** Call when a participant is added/removed (from the api side). */

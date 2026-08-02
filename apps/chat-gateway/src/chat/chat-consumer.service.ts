@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import type {
   KafkaChatEvent,
   KafkaMessageSentPayload,
@@ -8,6 +8,7 @@ import type {
 import { CassandraService } from '../messages/cassandra.service';
 import { ApiClientService } from '../internal/api-client.service';
 import { ConnectionRegistryService } from './connection-registry.service';
+import { KafkaService } from '../kafka/kafka.service';
 
 /**
  * MSS — Message Storage Service (the gateway's Kafka consumer role).
@@ -19,14 +20,47 @@ import { ConnectionRegistryService } from './connection-registry.service';
  * retry wraps handleKafkaEvent, so failures here never crash the consumer.
  */
 @Injectable()
-export class ChatConsumerService {
+export class ChatConsumerService implements OnModuleInit {
   private readonly logger = new Logger(ChatConsumerService.name);
 
   constructor(
     private readonly cassandraService: CassandraService,
     private readonly apiClient: ApiClientService,
     private readonly registry: ConnectionRegistryService,
+    private readonly kafkaService: KafkaService,
   ) {}
+
+  onModuleInit(): void {
+    // Register the final-skip handler. NOTE: the onEvent handler is registered
+    // by ChatGateway — a second onEvent registration would double-persist every
+    // message. This registry fires only for events the consumer gave up on.
+    this.kafkaService.onEventSkipped((event) => this.onEventSkipped(event));
+  }
+
+  /**
+   * Final-skip callback: an event exhausted the consumer's retries and was
+   * published to the DLQ. For MESSAGE_SENT, surface PERSIST_FAILED to the
+   * sender so the FE fails exactly the optimistic row it inserted (matched by
+   * clientMessageId). Read/delivered receipts are soft state — warn only.
+   */
+  private async onEventSkipped(event: KafkaChatEvent): Promise<void> {
+    if (event.type === 'MESSAGE_SENT') {
+      this.registry.sendToUserSockets(
+        event.senderId,
+        'error',
+        {
+          code: 'PERSIST_FAILED',
+          message: 'Message could not be saved',
+          clientMessageId: event.clientMessageId,
+          conversationId: event.conversationId,
+        },
+      );
+      return;
+    }
+    this.logger.warn(
+      `⚠️  Kafka event ${event.type} skipped after exhausting retries — soft state, not surfaced to clients`,
+    );
+  }
 
   async handleKafkaEvent(event: KafkaChatEvent): Promise<void> {
     switch (event.type) {
@@ -71,6 +105,22 @@ export class ChatConsumerService {
         content: event.content,
         createdAt: event.createdAt,
       },
+    );
+
+    // 3. Also route to the sender's OTHER devices, excluding the origin socket
+    // — it already got `message_sent`, and a second frame would duplicate the
+    // optimistic row the FE inserted. (sendToUserSockets is synchronous.)
+    this.registry.sendToUserSockets(
+      event.senderId,
+      'message_received',
+      {
+        messageId: event.messageId,
+        conversationId: event.conversationId,
+        senderId: event.senderId,
+        content: event.content,
+        createdAt: event.createdAt,
+      },
+      event.senderSocketId, // may be undefined for legacy events → sends to all sender sockets; FE dedupes by messageId
     );
   }
 
@@ -118,13 +168,21 @@ export class ChatConsumerService {
 
   /** MSS: Persist read receipt, route double blue tick to sender. */
   private async onKafkaMessageRead(event: KafkaMessageReadPayload): Promise<void> {
-    // Persist read receipt to Cassandra (gateway-owned durable copy)
-    await this.cassandraService.markConversationRead(
-      event.conversationId,
-      event.readerId,
-      event.lastReadMessageId,
-    );
-    this.logger.log(`👁️  Read receipt stored — ${event.readerId} read up to ${event.lastReadMessageId}`);
+    // Persist read receipt to Cassandra (gateway-owned durable copy). Wrapped
+    // so a Cassandra failure doesn't couple to the api watermark advance or the
+    // live broadcast below (the api is the other store owner and still healthy).
+    try {
+      await this.cassandraService.markConversationRead(
+        event.conversationId,
+        event.readerId,
+        event.lastReadMessageId,
+      );
+      this.logger.log(`👁️  Read receipt stored — ${event.readerId} read up to ${event.lastReadMessageId}`);
+    } catch (err) {
+      this.logger.warn(
+        `⚠️  Cassandra read-receipt persist failed for ${event.conversationId}: ${(err as Error).message} — continuing with api watermark + broadcast`,
+      );
+    }
 
     // Also advance the api's Postgres watermark (best-effort, dormant machinery).
     // This is what powers reload hydration: `GET /conversations` exposes

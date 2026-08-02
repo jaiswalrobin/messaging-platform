@@ -8,7 +8,7 @@ import {
   ConnectedSocket,
   MessageBody,
 } from '@nestjs/websockets';
-import { UseGuards, Logger } from '@nestjs/common';
+import { UseGuards, UsePipes, ValidationPipe, Logger } from '@nestjs/common';
 import { WebSocket, Server } from 'ws';
 import { WsAuthGuard } from '../auth/ws-auth.guard';
 import type {
@@ -29,9 +29,9 @@ import { types } from 'cassandra-driver';
 /**
  * WS producer handlers. Connection lifecycle, heartbeat and fan-out live in
  * ConnectionRegistryService; the Kafka consumer (MSS) role lives in
- * ChatConsumerService. DTO validation is handled by the global ValidationPipe
- * in main.ts (per-handler @UsePipes removed as redundant).
+ * ChatConsumerService. Incoming WebSocket event DTOs are validated using NestJS ValidationPipe.
  */
+@UsePipes(new ValidationPipe({ transform: true }))
 @WebSocketGateway({ cors: true })
 export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, OnGatewayInit {
   @WebSocketServer()
@@ -60,8 +60,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
 
   // ─── Connection lifecycle (delegated to the registry) ───────────────────────
 
-  handleConnection(client: any, request: any): void {
-    this.registry.handleConnection(client, request);
+  async handleConnection(client: any, request: any): Promise<void> {
+    await this.registry.handleConnection(client, request);
   }
 
   handleDisconnect(client: WebSocket): void {
@@ -101,6 +101,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
       content: data.content,
       clientMessageId: data.clientMessageId,
       createdAt,
+      senderSocketId: (client as any).socketId,
     };
 
     const published = await this.kafkaService.publish(kafkaPayload);
@@ -190,6 +191,36 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
     // Membership check before recording anything (IDOR prevention)
     const member = await this.registry.requireMember(data.conversationId, readerId, client);
     if (!member) {
+      return;
+    }
+
+    // Validate lastReadMessageId before it reaches Kafka / the api: garbage
+    // strings would hit the api's Postgres watermark CAS and 500 (22P02), and a
+    // forged future timestamp would advance the watermark arbitrarily and
+    // permanently block later legitimate reads.
+    let lastReadTimeUuid: types.TimeUuid;
+    try {
+      lastReadTimeUuid = types.TimeUuid.fromString(data.lastReadMessageId);
+    } catch {
+      this.logger.warn(
+        `⚠️  Invalid lastReadMessageId from ${readerId} in conversation ${data.conversationId}`,
+      );
+      this.registry.send(client, 'error', {
+        code: 'INTERNAL',
+        message: 'Invalid lastReadMessageId',
+        conversationId: data.conversationId,
+      });
+      return;
+    }
+    if (lastReadTimeUuid.getDate().getTime() > Date.now() + 60000) {
+      this.logger.warn(
+        `⚠️  Future-dated lastReadMessageId from ${readerId} in conversation ${data.conversationId}`,
+      );
+      this.registry.send(client, 'error', {
+        code: 'INTERNAL',
+        message: 'Invalid lastReadMessageId',
+        conversationId: data.conversationId,
+      });
       return;
     }
 
@@ -303,6 +334,21 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
         content: event.content,
         createdAt: event.createdAt,
       },
+    );
+
+    // Sender's other devices also get the message; the origin socket already got
+    // `message_sent` (a second frame would duplicate the optimistic row).
+    this.registry.sendToUserSockets(
+      event.senderId,
+      'message_received',
+      {
+        messageId: event.messageId,
+        conversationId: event.conversationId,
+        senderId: event.senderId,
+        content: event.content,
+        createdAt: event.createdAt,
+      },
+      (senderSocket as any).socketId,
     );
 
     // Best-effort summary to the sender: how many recipients actually got it
