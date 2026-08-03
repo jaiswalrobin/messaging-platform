@@ -6,6 +6,11 @@ import { Repository } from 'typeorm';
 import { getJwtSecret } from '@chat/shared-types';
 import { User } from '../users/user.entity';
 
+interface JwtPayload {
+  sub: string;
+  email?: string;
+}
+
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
   constructor(
@@ -19,7 +24,7 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     });
   }
 
-  async validate(payload: any) {
+  async validate(payload: JwtPayload) {
     // Reject tokens whose subject no longer exists in the DB. A validly
     // signed token for a deleted account would otherwise pass auth and
     // explode on the first FK write (participant insert) with a 500.

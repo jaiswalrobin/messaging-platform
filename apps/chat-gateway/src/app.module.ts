@@ -18,7 +18,10 @@ import { KafkaModule } from './kafka/kafka.module';
     // synchronize: false — chat-gateway minimal ConversationParticipant entity
     // reads from DB owned by `api`. `api` handles schema synchronization/migrations.
     TypeOrmModule.forRoot(getTypeOrmConfig({ synchronize: false })),
+    // global:true makes JwtService injectable app-wide, so no child module needs
+    // its own JwtModule.register (getJwtSecret() therefore runs exactly once).
     JwtModule.register({
+      global: true,
       secret: getJwtSecret(),
       signOptions: { expiresIn: JWT_EXPIRES_IN },
     }),

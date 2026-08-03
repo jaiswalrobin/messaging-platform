@@ -28,6 +28,9 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
   private admin: Admin;
   private available = false;
 
+  // Set true once on shutdown so a pending reconnect can't resurrect the consumer.
+  private destroyed = false;
+
   // Broker list retained for reconnect logging
   private brokers: string[];
 
@@ -75,6 +78,27 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
     });
     this.consumer = this.kafka.consumer({ groupId: 'chat-gateway-group' });
 
+    // Runtime resilience: if the broker dies or the consumer crashes, flip
+    // `available` false and re-arm the reconnect loop so /health stops lying and
+    // the consumer can come back without a restart.
+    this.producer.on('producer.connect', () => this.logger.log('✅ Kafka producer connected'));
+    this.producer.on('producer.disconnect', () =>
+      this.logger.warn('⚠️ Kafka producer disconnected'),
+    );
+    // kafkajs Producer has no `producer.error` event; broker-death detection is
+    // handled by consumer.crash (below) + the producer's own network events.
+
+    this.consumer.on('consumer.connect', () => this.logger.log('✅ Kafka consumer connected'));
+    this.consumer.on('consumer.disconnect', () =>
+      this.logger.warn('⚠️ Kafka consumer disconnected'),
+    );
+    this.consumer.on('consumer.crash', (event) => {
+      this.logger.error(
+        `❌ Kafka consumer crashed: ${(event as { error?: Error })?.error?.message ?? JSON.stringify(event)}`,
+      );
+      this.handleRuntimeDisconnect();
+    });
+
     // Issue 19: reconnect on boot failure. connectKafkaWithRetry re-runs the
     // full sequence every 15s until it succeeds, then flips available and stops.
     await this.connectKafkaWithRetry();
@@ -85,8 +109,14 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
    * serving in direct-delivery mode while a 15s timer retries the connect.
    */
   private async connectKafkaWithRetry(): Promise<void> {
+    // Shutdown safety: never resurrect the consumer after destroy.
+    if (this.destroyed) return;
     try {
       await this.connectKafka();
+      if (this.retryTimer) {
+        clearTimeout(this.retryTimer);
+        this.retryTimer = undefined;
+      }
       this.available = true;
       this.logger.log(`✅ Kafka connected — broker(s): ${this.brokers.join(', ')}`);
     } catch (err) {
@@ -94,10 +124,41 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
       this.logger.error(
         `❌ Kafka connect attempt ${this.attempts} failed (${(err as Error).message}) — retrying in ${RETRY_INTERVAL_MS / 1000}s`,
       );
-      this.retryTimer = setTimeout(() => {
-        void this.connectKafkaWithRetry();
-      }, RETRY_INTERVAL_MS);
+      this.armReconnect();
     }
+  }
+
+  /**
+   * Called when a runtime producer error / consumer crash flips the broker to
+   * unavailable. Resets the runtime connection flags so a reconnect re-establishes
+   * the live producer + consumer instead of skipping to a no-op "available",
+   * then re-arms the bounded reconnect loop (guarded so it never stacks).
+   */
+  private handleRuntimeDisconnect(): void {
+    if (this.destroyed || this.available === false) {
+      // Already down / a reconnect is in flight — don't stack.
+      return;
+    }
+    this.available = false;
+    this.logger.warn('⚠️ Kafka lost connection — reconnecting…');
+
+    // Reset the connect-sequence gates so a retry actually reconnects. Topics
+    // already exist, so admin stays connected (recreate is idempotent anyway).
+    this.producerConnected = false;
+    this.consumerConnected = false;
+    this.subscribed = false;
+    this.running = false;
+
+    this.armReconnect();
+  }
+
+  /** (Re)arm the 15s reconnect timer once; a pending timer is never doubled up. */
+  private armReconnect(): void {
+    if (this.destroyed || this.retryTimer) return;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = undefined;
+      void this.connectKafkaWithRetry();
+    }, RETRY_INTERVAL_MS);
   }
 
   /**
@@ -167,16 +228,22 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
           }
 
           for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-            try {
-              await Promise.all(this.handlers.map((h) => h(event)));
-              return;
-            } catch (err) {
-              this.logger.error(
-                `❌ Kafka event ${event.type} processing failed (attempt ${attempt}/${MAX_ATTEMPTS}): ${(err as Error).message}`,
-              );
-              if (attempt < MAX_ATTEMPTS) {
-                await new Promise((r) => setTimeout(r, 500 * attempt));
+            // Run handlers independently: a throw in one must not re-run the
+            // already-succeeded handlers nor re-throw into the batch retrier.
+            let failed = false;
+            for (const handler of this.handlers) {
+              try {
+                await handler(event);
+              } catch (err) {
+                failed = true;
+                this.logger.error(
+                  `❌ Kafka event ${event.type} handler failed (attempt ${attempt}/${MAX_ATTEMPTS}): ${(err as Error).message}`,
+                );
               }
+            }
+            if (!failed) return;
+            if (attempt < MAX_ATTEMPTS) {
+              await new Promise((r) => setTimeout(r, 500 * attempt));
             }
           }
 
@@ -218,6 +285,7 @@ export class KafkaService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.destroyed = true;
     this.handlers = [];
     this.skipHandlers = [];
     if (this.retryTimer) {

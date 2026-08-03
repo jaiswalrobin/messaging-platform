@@ -29,8 +29,13 @@ function uuidV1Timestamp(uuid: string): number {
   // char 14 is the version nibble; time_hi is the remaining 3 nibbles (12 bits)
   const timeHi = parseInt(uuid.slice(15, 18), 16);
   // Assemble the 60-bit value. The high terms exceed 2^32, so multiply rather
-  // than use bitwise OR (which truncates to 32 bits). The result stays well
-  // below 2^53, so it is represented exactly as a JS Number.
+  // than use bitwise OR (which truncates to 32 bits). For a current-epoch v1
+  // uuid the result is ~1.4e17 ≈ 2^57, which EXCEEDS 2^53 — JS Numbers only
+  // represent integers exactly up to 2^53, so this is a close approximation
+  // with a ULP of ~30 (≈ 3µs of 100-ns ticks). Two ids generated within ~3µs
+  // of each other can therefore compare equal. That's fine here because read
+  // watermarks are soft state, but the value is NOT exact — don't rely on
+  // byte-perfect ordering at sub-3µs granularity.
   return timeHi * 2 ** 48 + timeMid * 2 ** 32 + timeLow;
 }
 
@@ -48,15 +53,15 @@ export class ConversationsService {
   ) {}
 
   private mapParticipants(participants: ConversationParticipant[]) {
-    return participants.map((p) => ({
-      userId: p.userId,
-      email: p.user.email,
-      role: p.role,
-      joinedAt: p.joinedAt,
+    return participants.map((participant) => ({
+      userId: participant.userId,
+      email: participant.user.email,
+      role: participant.role,
+      joinedAt: participant.joinedAt,
       // Read-receipt watermark — exposed so clients can hydrate blue ticks for
       // messages read while they were offline. Soft state; may lag the live
       // signal, which the gateway's `message_read` fan-out covers in real time.
-      lastReadMessageId: p.lastReadMessageId,
+      lastReadMessageId: participant.lastReadMessageId,
     }));
   }
 
@@ -132,23 +137,31 @@ export class ConversationsService {
     limit?: number,
     offset?: number,
   ) {
-    const safeLimit =
-      limit && !isNaN(limit) && limit > 0
-        ? Math.min(limit, MAX_HISTORY_LIMIT)
-        : undefined;
-    const safeOffset =
-      offset && !isNaN(offset) && offset >= 0 ? offset : undefined;
+    // Distinguish an explicit 0 from "not provided": a caller passing
+    // `limit: 0` means it, so clamp it up to 1 rather than silently treating it
+    // as "no limit" (which `limit && ...` did). Valid limits clamp to [1, MAX].
+    const hasLimit = limit !== undefined && !isNaN(limit);
+    const safeLimit = hasLimit
+      ? Math.max(1, Math.min(limit, MAX_HISTORY_LIMIT))
+      : undefined;
+    const hasOffset = offset !== undefined && !isNaN(offset);
+    const safeOffset = hasOffset ? Math.max(0, offset) : undefined;
 
-    // Find all conversation IDs where this user is a participant
+    // Find all conversation IDs where this user is a participant. The ORDER BY
+    // makes offset pagination deterministic: rows can't shift between pages
+    // when conversation order is stable (updatedAt can tie, so id breaks it).
     const participations = await this.participantRepo.find({
       where: { userId },
       relations: { conversation: true },
+      order: { conversation: { updatedAt: 'DESC', id: 'ASC' } },
       ...(safeLimit !== undefined ? { take: safeLimit } : {}),
       ...(safeOffset !== undefined ? { skip: safeOffset } : {}),
     });
 
     // Fetch participants for all conversations in one query
-    const conversationIds = participations.map((p) => p.conversation.id);
+    const conversationIds = participations.map(
+      (participation) => participation.conversation.id,
+    );
     const allParticipants =
       conversationIds.length > 0
         ? await this.participantRepo.find({
@@ -162,10 +175,10 @@ export class ConversationsService {
       ConversationParticipant[]
     >();
     for (const participant of allParticipants) {
-      const list =
+      const participantList =
         participantsByConversation.get(participant.conversationId) ?? [];
-      list.push(participant);
-      participantsByConversation.set(participant.conversationId, list);
+      participantList.push(participant);
+      participantsByConversation.set(participant.conversationId, participantList);
     }
 
     return participations.map((participation) =>
@@ -200,6 +213,32 @@ export class ConversationsService {
     }
   }
 
+  /**
+   * Best-effort invalidation of the gateway's participant cache — never fail the
+   * caller. A non-2xx response (e.g. gateway 401/500) is logged as a warning
+   * just like a network error; both are non-fatal soft-state misses.
+   */
+  private async invalidateGatewayParticipantCache(conversationId: string) {
+    try {
+      const res = await fetch(
+        `http://${process.env.GATEWAY_URL ?? 'localhost:8080'}/internal/participants/${conversationId}/invalidate`,
+        {
+          method: 'POST',
+          headers: { 'x-internal-key': getInternalApiKey() },
+        },
+      );
+      if (!res.ok) {
+        this.logger.warn(
+          `⚠️ Gateway invalidation failed (non-fatal): HTTP ${res.status}`,
+        );
+      }
+    } catch (err) {
+      this.logger.warn(
+        `⚠️ Gateway invalidation failed (non-fatal): ${(err as Error).message}`,
+      );
+    }
+  }
+
   async createGroup(
     creatorId: string,
     title: string,
@@ -230,16 +269,20 @@ export class ConversationsService {
       }
 
       // 4. Create other participants as members (deduped so duplicate
-      // participantIds can't violate the (conversation_id, user_id) PK)
-      for (const participantId of [...new Set(participantIds)]) {
-        if (participantId === creatorId) continue; // Don't add creator twice
-
-        const memberParticipant = this.participantRepo.create({
-          conversationId: saved.id,
-          userId: participantId,
-          role: 'member',
-        });
-        await manager.save(memberParticipant);
+      // participantIds can't violate the (conversation_id, user_id) PK).
+      // Build all member entities first, then insert them in one bulk save
+      // instead of a per-participant round trip.
+      const memberParticipants = [...new Set(participantIds)]
+        .filter((participantId) => participantId !== creatorId) // Don't add creator twice
+        .map((participantId) =>
+          this.participantRepo.create({
+            conversationId: saved.id,
+            userId: participantId,
+            role: 'member',
+          }),
+        );
+      if (memberParticipants.length > 0) {
+        await manager.save(memberParticipants);
       }
 
       return saved;
@@ -286,7 +329,9 @@ export class ConversationsService {
     const existingParticipants = await this.participantRepo.find({
       where: { conversationId },
     });
-    const existingIds = new Set(existingParticipants.map((p) => p.userId));
+    const existingIds = new Set(
+      existingParticipants.map((participant) => participant.userId),
+    );
 
     // Filter once to the id list; entities are only wrapped after validation
     // survives, so we never map to entities and immediately re-unwrap them.
@@ -317,20 +362,7 @@ export class ConversationsService {
         await manager.save(newParticipants);
       });
 
-      // Best-effort invalidation of the gateway's participant cache — never fail the request.
-      try {
-        await fetch(
-          `http://${process.env.GATEWAY_URL ?? 'localhost:8080'}/internal/participants/${conversationId}/invalidate`,
-          {
-            method: 'POST',
-            headers: { 'x-internal-key': getInternalApiKey() },
-          },
-        );
-      } catch (err) {
-        this.logger.warn(
-          `⚠️ Gateway invalidation failed (non-fatal): ${(err as Error).message}`,
-        );
-      }
+      await this.invalidateGatewayParticipantCache(conversationId);
     }
 
     // Return the same DTO shape as every other conversation endpoint — the
@@ -358,8 +390,11 @@ export class ConversationsService {
   ): Promise<{ advanced: boolean }> {
     // The watermark must be a canonical v1 timeuuid — reject anything else up
     // front (garbage would 22P02 on Postgres's uuid cast and NaN the compares).
+    // The version nibble is pinned to '1' (not '[1-6]'): a well-formed v2–v6 uuid
+    // with a past timestamp field would otherwise be written as the watermark,
+    // forging blue ticks. (The gateway enforces the same gate before publishing.)
     if (
-      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-6][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-1[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
         lastReadMessageId,
       )
     ) {
@@ -381,58 +416,19 @@ export class ConversationsService {
       return { advanced: false };
     }
 
-    // First read in this conversation — advance from NULL.
-    if (existing.lastReadMessageId === null) {
-      const result = await this.participantRepo
-        .createQueryBuilder()
-        .update(ConversationParticipant)
-        .set({ lastReadMessageId })
-        .where('conversation_id = :conversationId', { conversationId })
-        .andWhere('user_id = :userId', { userId })
-        .andWhere('last_read_message_id IS NULL')
-        .execute();
-
-      const advanced = (result.affected ?? 0) > 0;
-      if (!advanced) {
-        const current = await this.participantRepo.findOne({
-          where: { conversationId, userId },
-          select: { lastReadMessageId: true },
-        });
-        if (
-          current?.lastReadMessageId &&
-          uuidV1Timestamp(current.lastReadMessageId) >=
-            uuidV1Timestamp(lastReadMessageId)
-        ) {
-          return { advanced: true };
-        }
-        // CAS lost to a concurrent advance that is still older than the requested
-        // id — retry once against the fresh value so the newer receipt isn't stranded.
-        const retry = await this.participantRepo
-          .createQueryBuilder()
-          .update(ConversationParticipant)
-          .set({ lastReadMessageId })
-          .where('conversation_id = :conversationId', { conversationId })
-          .andWhere('user_id = :userId', { userId })
-          .andWhere(
-            current?.lastReadMessageId
-              ? 'last_read_message_id = :current'
-              : 'last_read_message_id IS NULL',
-            current?.lastReadMessageId
-              ? { current: current.lastReadMessageId }
-              : {},
-          )
-          .execute();
-        return { advanced: (retry.affected ?? 0) > 0 };
-      }
-      return { advanced };
-    }
+    // The NULL (first read) and non-NULL branches below were identical except
+    // for the CAS predicate (`last_read_message_id IS NULL` vs `= :current`).
+    // Collapse them into one path: `currentValue` is the watermark we CAS
+    // against, and `casWhere` renders the predicate — a bound `current` value,
+    // or `IS NULL` when the watermark is NULL.
+    const currentValue = existing.lastReadMessageId;
 
     // Only advance if the new receipt is genuinely newer (chronological, not
-    // byte-order). Compare-and-swap on the current value so a concurrent
-    // advance wins cleanly instead of being clobbered by a stale one.
+    // byte-order). When the watermark is NULL there is nothing to compare
+    // against — any id is newer than NULL, so skip the stale check.
     if (
-      uuidV1Timestamp(lastReadMessageId) <=
-      uuidV1Timestamp(existing.lastReadMessageId)
+      currentValue !== null &&
+      uuidV1Timestamp(lastReadMessageId) <= uuidV1Timestamp(currentValue)
     ) {
       this.logger.debug(
         `mark_read no-op for ${userId} in ${conversationId} (stale receipt)`,
@@ -440,25 +436,36 @@ export class ConversationsService {
       return { advanced: false };
     }
 
-    const result = await this.participantRepo
-      .createQueryBuilder()
-      .update(ConversationParticipant)
-      .set({ lastReadMessageId })
-      .where('conversation_id = :conversationId', { conversationId })
-      .andWhere('user_id = :userId', { userId })
-      .andWhere('last_read_message_id = :current', {
-        current: existing.lastReadMessageId,
-      })
-      .execute();
+    // Render the parameterized CAS predicate for the given stored watermark.
+    const casWhere = (current: string | null) =>
+      current !== null
+        ? { sql: 'last_read_message_id = :current', params: { current } }
+        : { sql: 'last_read_message_id IS NULL', params: {} };
 
+    // CAS-update the watermark against the given stored value. A single code
+    // path covers both the first read (CAS on NULL) and later advances (CAS on
+    // the current value).
+    const runCas = (current: string | null) =>
+      this.participantRepo
+        .createQueryBuilder()
+        .update(ConversationParticipant)
+        .set({ lastReadMessageId })
+        .where('conversation_id = :conversationId', { conversationId })
+        .andWhere('user_id = :userId', { userId })
+        .andWhere(casWhere(current).sql, casWhere(current).params)
+        .execute();
+
+    const result = await runCas(currentValue);
     const advanced = (result.affected ?? 0) > 0;
     if (!advanced) {
-      // Race lost to concurrent advance: re-query current watermark
+      // CAS lost to a concurrent advance: re-query current watermark.
       const current = await this.participantRepo.findOne({
         where: { conversationId, userId },
         select: { lastReadMessageId: true },
       });
 
+      // A concurrent advance that is already at-or-newer than the requested id
+      // means the watermark did move forward — report advanced.
       if (
         current?.lastReadMessageId &&
         uuidV1Timestamp(current.lastReadMessageId) >=
@@ -474,22 +481,9 @@ export class ConversationsService {
       // id) — retry once against the fresh value so the newer receipt isn't
       // stranded. The retry can only fail if another writer moved the watermark
       // to >= requested in the meantime, keeping advanced=false only when the
-      // stored value is already at-or-newer.
-      //
-      // This is the non-null branch: the watermark is never reset to NULL, so
-      // the re-queried value is non-null too — bind it directly (a vanished row
-      // binds null and simply matches nothing).
-      const retry = await this.participantRepo
-        .createQueryBuilder()
-        .update(ConversationParticipant)
-        .set({ lastReadMessageId })
-        .where('conversation_id = :conversationId', { conversationId })
-        .andWhere('user_id = :userId', { userId })
-        .andWhere('last_read_message_id = :current', {
-          current: current?.lastReadMessageId ?? null,
-        })
-        .execute();
-
+      // stored value is already at-or-newer. (A re-queried NULL — e.g. a vanished
+      // row — CASes on `IS NULL` and simply matches nothing.)
+      const retry = await runCas(current?.lastReadMessageId ?? null);
       return { advanced: (retry.affected ?? 0) > 0 };
     }
     return { advanced };
@@ -531,19 +525,19 @@ export class ConversationsService {
         });
         const saved = await manager.save(conversation);
 
-        const p1 = this.participantRepo.create({
+        const participant1 = this.participantRepo.create({
           conversationId: saved.id,
           userId,
           role: 'member',
         });
 
-        const p2 = this.participantRepo.create({
+        const participant2 = this.participantRepo.create({
           conversationId: saved.id,
           userId: targetUserId,
           role: 'member',
         });
 
-        await manager.save([p1, p2]);
+        await manager.save([participant1, participant2]);
         return saved;
       });
 

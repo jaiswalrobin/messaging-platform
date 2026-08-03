@@ -27,6 +27,21 @@ import { MessageDeliveredDto } from './dto/message-delivered.dto';
 import { types } from 'cassandra-driver';
 
 /**
+ * Canonical uuid form is xxxxxxxx-xxxx-Vxxx-... — this is the index of the
+ * version nibble (V) in the 36-char string. The api's watermark CAS regex
+ * mirrors this (the version nibble must be '1').
+ */
+const V1_VERSION_NIBBLE_INDEX = 14;
+
+/**
+ * Skew allowance, in ms, for accepting a mark_read watermark as "not future".
+ * A crafted v1 timeuuid carries its own timestamp field; this tolerance lets a
+ * slightly future-dated client clock through while still rejecting a forged
+ * far-future timestamp that would permanently block later legitimate reads.
+ */
+const FUTURE_SKEW_MS = 60000;
+
+/**
  * WS producer handlers. Connection lifecycle, heartbeat and fan-out live in
  * ConnectionRegistryService; the Kafka consumer (MSS) role lives in
  * ChatConsumerService. Incoming WebSocket event DTOs are validated using NestJS ValidationPipe.
@@ -79,10 +94,10 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
     const senderId: string = (client as any).user.userId;
 
     // ── Step 0: Membership check (IDOR prevention) ─────────────────────────
-    const member = await this.registry.requireMember(data.conversationId, senderId, client, {
+    const isMember = await this.registry.requireMember(data.conversationId, senderId, client, {
       clientMessageId: data.clientMessageId,
     });
-    if (!member) {
+    if (!isMember) {
       return;
     }
 
@@ -104,10 +119,10 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
       senderSocketId: (client as any).socketId,
     };
 
-    const published = await this.kafkaService.publish(kafkaPayload);
+    const isPublished = await this.kafkaService.publish(kafkaPayload);
 
     // ── Step 2: ACK sender immediately after Kafka ACK (or direct mode) ────
-    if (published) {
+    if (isPublished) {
       // Kafka-first: Kafka ACK received → send single tick to sender
       this.registry.send(client, 'message_sent', {
         messageId,
@@ -151,8 +166,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
     const recipientId: string = (client as any).user.userId;
 
     // Membership check before recording anything (IDOR prevention)
-    const member = await this.registry.requireMember(data.conversationId, recipientId, client);
-    if (!member) {
+    const isMember = await this.registry.requireMember(data.conversationId, recipientId, client);
+    if (!isMember) {
       return;
     }
 
@@ -168,8 +183,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
       deliveredAt,
     };
 
-    const published = await this.kafkaService.publish(kafkaPayload);
-    if (!published) {
+    const isPublished = await this.kafkaService.publish(kafkaPayload);
+    if (!isPublished) {
       // Broker down → the consumer can't route the receipt; soft state, dropped.
       this.logger.warn(
         `⚠️  Kafka unavailable — delivery receipt for ${data.messageId} dropped`,
@@ -189,15 +204,21 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
     const readerId: string = (client as any).user.userId;
 
     // Membership check before recording anything (IDOR prevention)
-    const member = await this.registry.requireMember(data.conversationId, readerId, client);
-    if (!member) {
+    const isMember = await this.registry.requireMember(data.conversationId, readerId, client);
+    if (!isMember) {
       return;
     }
 
-    // Validate lastReadMessageId before it reaches Kafka / the api: garbage
-    // strings would hit the api's Postgres watermark CAS and 500 (22P02), and a
-    // forged future timestamp would advance the watermark arbitrarily and
-    // permanently block later legitimate reads.
+    // Validate lastReadMessageId before it reaches Kafka / the api. Three gates:
+    // (1) it must parse as a uuid, (2) it must be a v1 timeuuid — the driver's
+    // TimeUuid.fromString (→ Uuid.fromString) validates length + hex only, NOT the
+    // version nibble, so a crafted v4/v5 uuid with a past timestamp field would
+    // otherwise pass and be written as the watermark, forging blue ticks — and
+    // (3) it must not be future-dated (a forged future timestamp would advance the
+    // watermark arbitrarily and permanently block later legitimate reads).
+    // mark_read is fire-and-forget soft state, so every rejection is a silent
+    // log + return: an INTERNAL error frame here has no clientMessageId, so the FE
+    // could not know which row it referred to.
     let lastReadTimeUuid: types.TimeUuid;
     try {
       lastReadTimeUuid = types.TimeUuid.fromString(data.lastReadMessageId);
@@ -205,22 +226,21 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
       this.logger.warn(
         `⚠️  Invalid lastReadMessageId from ${readerId} in conversation ${data.conversationId}`,
       );
-      this.registry.send(client, 'error', {
-        code: 'INTERNAL',
-        message: 'Invalid lastReadMessageId',
-        conversationId: data.conversationId,
-      });
       return;
     }
-    if (lastReadTimeUuid.getDate().getTime() > Date.now() + 60000) {
+    // Canonical uuid is xxxxxxxx-xxxx-Vxxx-... — the version nibble sits at
+    // V1_VERSION_NIBBLE_INDEX. The api's watermark CAS regex mirrors this
+    // (version nibble must be '1').
+    if (data.lastReadMessageId[V1_VERSION_NIBBLE_INDEX] !== '1') {
+      this.logger.warn(
+        `⚠️  Non-v1 lastReadMessageId from ${readerId} in conversation ${data.conversationId} — rejected (v1 required)`,
+      );
+      return;
+    }
+    if (lastReadTimeUuid.getDate().getTime() > Date.now() + FUTURE_SKEW_MS) {
       this.logger.warn(
         `⚠️  Future-dated lastReadMessageId from ${readerId} in conversation ${data.conversationId}`,
       );
-      this.registry.send(client, 'error', {
-        code: 'INTERNAL',
-        message: 'Invalid lastReadMessageId',
-        conversationId: data.conversationId,
-      });
       return;
     }
 
@@ -238,8 +258,8 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
 
     // publish() never throws — it returns false when Kafka is unavailable — so
     // the failure handling is a warn log, consistent with handleDeliveryAck.
-    const published = await this.kafkaService.publish(kafkaPayload);
-    if (!published) {
+    const isPublished = await this.kafkaService.publish(kafkaPayload);
+    if (!isPublished) {
       this.logger.warn(
         `⚠️  Kafka unavailable — read receipt for ${data.lastReadMessageId} dropped`,
       );
@@ -261,17 +281,38 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
     this.logger.log(`📜 Fetching last ${limit} messages for conversation ${data.conversationId}`);
 
     // Membership check before fetching history (IDOR prevention)
-    const member = await this.registry.requireMember(data.conversationId, userId, client);
-    if (!member) {
+    const isMember = await this.registry.requireMember(data.conversationId, userId, client);
+    if (!isMember) {
       return;
     }
 
     try {
       const messages = await this.cassandraService.getMessages(data.conversationId, limit);
 
+      // Attach per-message receipt state so history hydrates gray/blue ticks on
+      // reload. Best-effort: if the receipt query fails, fall back to empty
+      // receipt arrays rather than failing the whole fetch.
+      let receiptsByMessage: Record<string, Array<{ userId: string; status: 'delivered' | 'read' }>> = {};
+      try {
+        const ids = messages.map((message: { id: string }) => message.id);
+        receiptsByMessage = await this.cassandraService.getReceiptsForMessages(
+          data.conversationId,
+          ids,
+        );
+      } catch (err) {
+        this.logger.warn(
+          `⚠️  Failed to fetch receipts for ${data.conversationId}: ${(err as Error).message} — returning history without receipt state`,
+        );
+      }
+
+      const messagesWithReceipts = messages.map((message: { id: string }) => ({
+        ...message,
+        receipts: receiptsByMessage[message.id] ?? [],
+      }));
+
       this.registry.send(client, 'messages_history', {
         conversationId: data.conversationId,
-        messages,
+        messages: messagesWithReceipts,
       });
     } catch (err) {
       this.logger.error(
@@ -291,14 +332,16 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
    * Broker-down fallback for `message` events: persist to Cassandra and deliver
    * inline, bypassing the MSS consumer.
    *
-   * NOTE the intentional `message_delivered` shape difference vs the Kafka path:
-   * the fallback frame carries `clientMessageId` + `deliveredCount` (the sender's
-   * own socket is the only place that learns delivery — nothing is persisted to
-   * message_receipts, so the consumer-style recipientId/deliveredAt broadcast
-   * cannot be produced), whereas the consumer path broadcasts
-   * recipientId/deliveredAt to everyone but the acker and omits clientMessageId.
-   * The FE handles both shapes (matching its own messages by messageId, or by
-   * clientMessageId in direct-fallback mode).
+   * NOTE: direct mode does NOT produce delivery receipts. Nothing is persisted to
+   * message_receipts here, so the sender's gray/blue ticks come only from real
+   * app-level acks routed through the Kafka consumer — with Kafka down, receipts
+   * are dead until the broker recovers (the FE still matches its own messages by
+   * messageId, or by clientMessageId in direct-fallback mode).
+   *
+   * Only saveMessage's failure is a real failure here: the message WAS persisted,
+   * so any post-persist fan-out error must be swallowed, not propagated — if it
+   * reached handleMessage's catch it would send PERSIST_FAILED for a message that
+   * WAS saved, prompting the user to resend (a duplicate).
    */
   private async directPersistAndDeliver(
     event: KafkaMessageSentPayload,
@@ -310,56 +353,57 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
       event.content,
       event.messageId,
       new Date(event.createdAt),
+      event.clientMessageId,
     );
 
-    this.registry.send(senderSocket, 'message_sent', {
-      messageId: event.messageId,
-      conversationId: event.conversationId,
-      senderId: event.senderId,
-      content: event.content,
-      createdAt: event.createdAt,
-      clientMessageId: event.clientMessageId,
-      status: 'sent',
-    });
-
-    // Fan out message_received to online recipients (offline → dropped, no queue)
-    const deliveredCount = await this.registry.broadcastToParticipants(
-      event.conversationId,
-      event.senderId,
-      'message_received',
-      {
+    // Post-persist fan-out is best-effort. The message is durable in Cassandra,
+    // so a failure here means at worst that an online recipient misses the live
+    // frame and recovers on reload. Swallow and log rather than let it reach
+    // handleMessage's PERSIST_FAILED path (a message that WAS saved must never be
+    // reported as "could not be saved", which would trigger a duplicate resend).
+    try {
+      this.registry.send(senderSocket, 'message_sent', {
         messageId: event.messageId,
         conversationId: event.conversationId,
         senderId: event.senderId,
         content: event.content,
         createdAt: event.createdAt,
-      },
-    );
-
-    // Sender's other devices also get the message; the origin socket already got
-    // `message_sent` (a second frame would duplicate the optimistic row).
-    this.registry.sendToUserSockets(
-      event.senderId,
-      'message_received',
-      {
-        messageId: event.messageId,
-        conversationId: event.conversationId,
-        senderId: event.senderId,
-        content: event.content,
-        createdAt: event.createdAt,
-      },
-      (senderSocket as any).socketId,
-    );
-
-    // Best-effort summary to the sender: how many recipients actually got it
-    if (deliveredCount > 0) {
-      this.registry.send(senderSocket, 'message_delivered', {
-        messageId: event.messageId,
-        conversationId: event.conversationId,
         clientMessageId: event.clientMessageId,
-        status: 'delivered',
-        deliveredCount,
+        status: 'sent',
       });
+
+      // Fan out message_received to online recipients (offline → dropped, no queue)
+      await this.registry.broadcastToParticipants(
+        event.conversationId,
+        event.senderId,
+        'message_received',
+        {
+          messageId: event.messageId,
+          conversationId: event.conversationId,
+          senderId: event.senderId,
+          content: event.content,
+          createdAt: event.createdAt,
+        },
+      );
+
+      // Sender's other devices also get the message; the origin socket already got
+      // `message_sent` (a second frame would duplicate the optimistic row).
+      this.registry.sendToUserSockets(
+        event.senderId,
+        'message_received',
+        {
+          messageId: event.messageId,
+          conversationId: event.conversationId,
+          senderId: event.senderId,
+          content: event.content,
+          createdAt: event.createdAt,
+        },
+        (senderSocket as any).socketId,
+      );
+    } catch (err) {
+      this.logger.error(
+        `⚠️  Direct-delivery fan-out failed for ${event.messageId} (message already persisted): ${(err as Error).message}`,
+      );
     }
   }
 }

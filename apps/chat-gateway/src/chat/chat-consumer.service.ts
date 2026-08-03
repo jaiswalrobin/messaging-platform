@@ -83,29 +83,44 @@ export class ChatConsumerService implements OnModuleInit {
 
   /** MSS: Persist message to Cassandra, route to online recipients; offline recipients are dropped (no queue yet). */
   private async onKafkaMessageSent(event: KafkaMessageSentPayload): Promise<void> {
-    // 1. Persist to Cassandra (durable source of truth)
+    // 1. Persist to Cassandra (durable source of truth). This is the ONLY stage
+    //    whose failure means "the message was not saved", so it is left uncaught:
+    //    a throw here drives the consumer retry → DLQ → PERSIST_FAILED to the
+    //    sender, which is the correct signal (the FE fails the optimistic row).
     await this.cassandraService.saveMessage(
       event.conversationId,
       event.senderId,
       event.content,
       event.messageId,
       new Date(event.createdAt),
+      event.clientMessageId,
     );
     this.logger.log(`💾 Persisted message ${event.messageId} to Cassandra`);
 
-    // 2. Route to online recipients (all devices of each)
-    await this.registry.broadcastToParticipants(
-      event.conversationId,
-      event.senderId,
-      'message_received',
-      {
-        messageId: event.messageId,
-        conversationId: event.conversationId,
-        senderId: event.senderId,
-        content: event.content,
-        createdAt: event.createdAt,
-      },
-    );
+    // 2. Route to online recipients (all devices of each). Best-effort: a failure
+    //    here does NOT mean the message was lost — it is durable in Cassandra and
+    //    history, so undelivered recipients recover it on reload. Never rethrow:
+    //    rethrowing would drive the retry → DLQ → PERSIST_FAILED path and tell the
+    //    sender "could not be saved" for a message that WAS saved (→ user resends
+    //    → duplicate).
+    try {
+      await this.registry.broadcastToParticipants(
+        event.conversationId,
+        event.senderId,
+        'message_received',
+        {
+          messageId: event.messageId,
+          conversationId: event.conversationId,
+          senderId: event.senderId,
+          content: event.content,
+          createdAt: event.createdAt,
+        },
+      );
+    } catch (err) {
+      this.logger.error(
+        `⚠️  Recipient fan-out failed for ${event.messageId} (message already persisted): ${(err as Error).message}`,
+      );
+    }
 
     // 3. Also route to the sender's OTHER devices, excluding the origin socket
     // — it already got `message_sent`, and a second frame would duplicate the
@@ -133,11 +148,11 @@ export class ChatConsumerService implements OnModuleInit {
     // status may already have been overwritten to 'read' by markConversationRead
     // (monotone statuses, one row per message per user), so a delivered-only
     // check would let a late duplicate ack through.
-    const existing = await this.cassandraService.getReceipts(
+    const existingReceipts = await this.cassandraService.getReceipts(
       event.conversationId,
       event.messageId,
     );
-    if (existing.some((r) => r.userId === event.recipientId)) {
+    if (existingReceipts.some((receipt) => receipt.userId === event.recipientId)) {
       this.logger.log(`📬 Duplicate delivery ACK from ${event.recipientId} — skipped`);
       return;
     }
@@ -152,25 +167,53 @@ export class ChatConsumerService implements OnModuleInit {
 
     // Route status update to all participants except the acker (sender included).
     // The FE upgrades only its own outgoing messages, matched by messageId.
-    await this.registry.broadcastToParticipants(
-      event.conversationId,
-      event.recipientId,
-      'message_delivered',
-      {
-        messageId: event.messageId,
-        conversationId: event.conversationId,
-        recipientId: event.recipientId,
-        deliveredAt: event.deliveredAt,
-        status: 'delivered',
-      },
-    );
+    // Best-effort: the receipt row is already persisted above, so a transient
+    // fan-out failure must not rethrow — retrying would hit the dedup at the top
+    // (row already written) and the gray-tick broadcast would be permanently
+    // lost. Mirror the message_received fan-out handling in onKafkaMessageSent:
+    // log the error, never rethrow.
+    try {
+      await this.registry.broadcastToParticipants(
+        event.conversationId,
+        event.recipientId,
+        'message_delivered',
+        {
+          messageId: event.messageId,
+          conversationId: event.conversationId,
+          recipientId: event.recipientId,
+          deliveredAt: event.deliveredAt,
+          status: 'delivered',
+        },
+      );
+    } catch (err) {
+      this.logger.error(
+        `⚠️  Delivery receipt fan-out failed for ${event.messageId} (receipt already persisted): ${(err as Error).message}`,
+      );
+    }
   }
 
   /** MSS: Persist read receipt, route double blue tick to sender. */
   private async onKafkaMessageRead(event: KafkaMessageReadPayload): Promise<void> {
-    // Persist read receipt to Cassandra (gateway-owned durable copy). Wrapped
-    // so a Cassandra failure doesn't couple to the api watermark advance or the
-    // live broadcast below (the api is the other store owner and still healthy).
+    // The api's Postgres watermark is the read source of truth (and what powers
+    // reload hydration). Decide whether this read actually advanced BEFORE
+    // persisting anything, so a stale or replayed receipt (advanced: false)
+    // neither writes a Cassandra row nor broadcasts a backward-moving blue tick.
+    const verdict = await this.apiClient.markRead(
+      event.conversationId,
+      event.readerId,
+      event.lastReadMessageId,
+    );
+    if (verdict?.advanced === false) {
+      this.logger.debug(
+        `👁️  mark_read no-op for ${event.readerId} in ${event.conversationId} (stale) — nothing persisted or broadcast`,
+      );
+      return;
+    }
+
+    // The watermark advanced, or the api is unreachable (verdict null — the
+    // gateway's Cassandra copy is then the fallback truth). Persist the
+    // gateway-owned durable copy, wrapped so a Cassandra failure doesn't block
+    // the live signal below (the api is the other store owner and still healthy).
     try {
       await this.cassandraService.markConversationRead(
         event.conversationId,
@@ -180,38 +223,32 @@ export class ChatConsumerService implements OnModuleInit {
       this.logger.log(`👁️  Read receipt stored — ${event.readerId} read up to ${event.lastReadMessageId}`);
     } catch (err) {
       this.logger.warn(
-        `⚠️  Cassandra read-receipt persist failed for ${event.conversationId}: ${(err as Error).message} — continuing with api watermark + broadcast`,
+        `⚠️  Cassandra read-receipt persist failed for ${event.conversationId}: ${(err as Error).message} — continuing with broadcast`,
       );
     }
 
-    // Also advance the api's Postgres watermark (best-effort, dormant machinery).
-    // This is what powers reload hydration: `GET /conversations` exposes
-    // `lastReadMessageId` per participant, and the FE recomputes blue ticks from
-    // it. A null verdict (api unreachable) still relays the live signal below.
-    const verdict = await this.apiClient.markRead(
-      event.conversationId,
-      event.readerId,
-      event.lastReadMessageId,
-    );
-
-    // Only broadcast when the watermark actually moved forward — a stale or
-    // replayed receipt (advanced: false) must not flip ticks backward.
-    if (verdict?.advanced === false) {
-      return;
+    // Route blue tick to all OTHER participants (senders). Best-effort: the
+    // watermark (api Postgres) and gateway Cassandra copy are both persisted by
+    // now, so a transient fan-out failure must not rethrow — retrying would hit
+    // the api's markRead returning advanced:false (watermark already advanced)
+    // and the blue-tick broadcast would be permanently lost. Log, never rethrow.
+    try {
+      await this.registry.broadcastToParticipants(
+        event.conversationId,
+        event.readerId,
+        'message_read',
+        {
+          conversationId: event.conversationId,
+          lastReadMessageId: event.lastReadMessageId,
+          readerId: event.readerId,
+          readAt: event.readAt,
+          status: 'read',
+        },
+      );
+    } catch (err) {
+      this.logger.error(
+        `⚠️  Read receipt fan-out failed for ${event.readerId} in ${event.conversationId} (watermark already advanced): ${(err as Error).message}`,
+      );
     }
-
-    // Route blue tick to all OTHER participants (senders)
-    await this.registry.broadcastToParticipants(
-      event.conversationId,
-      event.readerId,
-      'message_read',
-      {
-        conversationId: event.conversationId,
-        lastReadMessageId: event.lastReadMessageId,
-        readerId: event.readerId,
-        readAt: event.readAt,
-        status: 'read',
-      },
-    );
   }
 }

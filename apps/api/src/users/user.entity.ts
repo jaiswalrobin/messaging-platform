@@ -13,7 +13,9 @@ export class User {
   @Column({ unique: true })
   email: string;
 
-  @Column()
+  // Excluded from default selects so the bcrypt hash isn't pulled on every
+  // relational fetch (latent leak). Only auth.login selects it explicitly.
+  @Column({ select: false })
   password: string;
 
   @CreateDateColumn()

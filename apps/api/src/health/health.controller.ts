@@ -14,12 +14,21 @@ export class HealthController {
     let postgres = false;
     try {
       // Probe Postgres with a ~2s budget so a hung DB can't wedge the check.
-      await Promise.race([
-        this.dataSource.query('SELECT 1'),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('timeout')), 2000),
-        ),
-      ]);
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          this.dataSource.query('SELECT 1'),
+          new Promise((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error('timeout')),
+              2000,
+            );
+          }),
+        ]);
+      } finally {
+        // Clear the timer once the race settles so it can't fire later.
+        if (timer) clearTimeout(timer);
+      }
       postgres = true;
     } catch {
       // probe failed — `postgres` already initialized to false

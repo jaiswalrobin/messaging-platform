@@ -36,7 +36,18 @@ export class AuthService {
       email: normalizedEmail,
       password: passwordHash,
     });
-    const savedUser = await this.userRepository.save(user);
+
+    let savedUser: User;
+    try {
+      savedUser = await this.userRepository.save(user);
+    } catch (err: any) {
+      // Postgres unique-violation on email (23505) — race between the pre-check
+      // above and the insert. Surface it as a 409 instead of a 500.
+      if (err?.code === '23505') {
+        throw new ConflictException('User already exists');
+      }
+      throw err;
+    }
 
     const token = this.generateToken(savedUser);
 
@@ -46,14 +57,19 @@ export class AuthService {
   async login(email: string, password: string): Promise<UserAuthResponse> {
     // Match the normalized form used at registration.
     const normalizedEmail = email.trim().toLowerCase();
-    const user = await this.userRepository.findOne({
-      where: { email: normalizedEmail },
-    });
+    const user = await this.userRepository
+      .createQueryBuilder('user')
+      .addSelect('user.password') // password column is select:false — load it only for login verification
+      .where('user.email = :email', { email: normalizedEmail })
+      .getOne();
     if (!user) {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    const isPasswordValid = await bcrypt.compare(password, user.password);
+    const isPasswordValid = await bcrypt.compare(
+      password,
+      user.password,
+    );
     if (!isPasswordValid) {
       throw new UnauthorizedException('Invalid credentials');
     }

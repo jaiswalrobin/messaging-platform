@@ -7,6 +7,7 @@ export interface MessageRecord {
   senderId: string;
   content: string;
   createdAt: Date;
+  clientMessageId?: string;
 }
 
 @Injectable()
@@ -57,7 +58,7 @@ export class CassandraService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy() {
-    await this.client.shutdown();
+    await this.client?.shutdown();
   }
 
   private async initSchema(): Promise<void> {
@@ -75,9 +76,27 @@ export class CassandraService implements OnModuleInit, OnModuleDestroy {
         id timeuuid,
         sender_id text,
         content text,
+        client_message_id text,
         PRIMARY KEY (conversation_id, created_at, id)
       ) WITH CLUSTERING ORDER BY (created_at DESC, id DESC)
     `);
+
+    // Idempotent migration for tables created before client_message_id existed.
+    // Cassandra 4.1 has NO `ADD COLUMN IF NOT EXISTS`, so check system_schema
+    // and ALTER only when the column is actually absent (bare ALTER throws if
+    // the column already exists — e.g. on a re-run after a partial migration).
+    const columnExists = await this.client.execute(
+      `SELECT column_name FROM system_schema.columns
+       WHERE keyspace_name = ? AND table_name = 'messages' AND column_name = 'client_message_id'`,
+      [this.keyspace],
+    );
+    if (columnExists.rowLength === 0) {
+      // NOTE: this Cassandra build rejects `ADD COLUMN ... text` (the COLUMN
+      // keyword is not accepted here) — the working form is a bare `ADD`.
+      await this.client.execute(
+        `ALTER TABLE ${this.keyspace}.messages ADD client_message_id text`,
+      );
+    }
 
     // message_receipts table: tracks per-user delivery/read status
     // Partitioned by conversation_id for fast lookup.
@@ -121,16 +140,21 @@ export class CassandraService implements OnModuleInit, OnModuleDestroy {
     content: string,
     messageId?: string,
     createdAt?: Date,
+    clientMessageId?: string,
   ): Promise<MessageRecord> {
     const id = messageId ? types.TimeUuid.fromString(messageId) : types.TimeUuid.now();
     const ts = createdAt ?? new Date();
 
     const query = `
-      INSERT INTO ${this.keyspace}.messages (conversation_id, created_at, id, sender_id, content)
-      VALUES (?, ?, ?, ?, ?)
+      INSERT INTO ${this.keyspace}.messages (conversation_id, created_at, id, sender_id, content, client_message_id)
+      VALUES (?, ?, ?, ?, ?, ?)
     `;
 
-    await this.client.execute(query, [conversationId, ts, id, senderId, content], { prepare: true });
+    await this.client.execute(
+      query,
+      [conversationId, ts, id, senderId, content, clientMessageId ?? null],
+      { prepare: true },
+    );
 
     return {
       id: id.toString(),
@@ -138,12 +162,13 @@ export class CassandraService implements OnModuleInit, OnModuleDestroy {
       senderId,
       content,
       createdAt: ts,
+      clientMessageId,
     };
   }
 
   async getMessages(conversationId: string, limit = 20): Promise<MessageRecord[]> {
     const query = `
-      SELECT conversation_id, created_at, id, sender_id, content
+      SELECT conversation_id, created_at, id, sender_id, content, client_message_id
       FROM ${this.keyspace}.messages
       WHERE conversation_id = ?
       LIMIT ?
@@ -157,6 +182,7 @@ export class CassandraService implements OnModuleInit, OnModuleDestroy {
       senderId: row.sender_id,
       content: row.content,
       createdAt: row.created_at,
+      clientMessageId: row.client_message_id,
     }));
   }
 
@@ -183,7 +209,9 @@ export class CassandraService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Mark all messages in a conversation as read for a user up to a given message.
+   * Write a SINGLE read-receipt watermark row: records that `userId` has read up
+   * to (and including) `upToMessageId`. It does NOT enumerate or mark every
+   * message as read — the FE infers earlier messages as read from this watermark.
    */
   async markConversationRead(
     conversationId: string,
@@ -212,5 +240,41 @@ export class CassandraService implements OnModuleInit, OnModuleDestroy {
       status: row.status,
       updatedAt: row.updated_at,
     }));
+  }
+
+  /**
+   * Batch-fetch delivery/read status for many messages in a conversation.
+   * Keyed by message_id; each value is the receipts for that message.
+   * Handles the empty-array case (returns {}).
+   */
+  async getReceiptsForMessages(
+    conversationId: string,
+    messageIds: string[],
+  ): Promise<Record<string, Array<{ userId: string; status: 'delivered' | 'read' }>>> {
+    if (messageIds.length === 0) {
+      return {};
+    }
+
+    const query = `
+      SELECT message_id, user_id, status
+      FROM ${this.keyspace}.message_receipts
+      WHERE conversation_id = ? AND message_id IN (${messageIds.map(() => '?').join(', ')})
+    `;
+
+    const result = await this.client.execute(
+      query,
+      [conversationId, ...messageIds],
+      { prepare: true },
+    );
+
+    const receipts: Record<string, Array<{ userId: string; status: 'delivered' | 'read' }>> = {};
+    for (const row of result.rows) {
+      const messageId = row.message_id;
+      if (!receipts[messageId]) {
+        receipts[messageId] = [];
+      }
+      receipts[messageId].push({ userId: row.user_id, status: row.status });
+    }
+    return receipts;
   }
 }

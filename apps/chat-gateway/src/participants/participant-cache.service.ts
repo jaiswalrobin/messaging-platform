@@ -67,7 +67,7 @@ export class ParticipantCacheService implements OnModuleInit, OnModuleDestroy {
       where: { conversationId },
       select: { userId: true },
     });
-    const userIds = participants.map((p) => p.userId);
+    const userIds = participants.map((participant) => participant.userId);
 
     // 3. Best-effort cache write
     if (userIds.length > 0) {
@@ -102,13 +102,20 @@ export class ParticipantCacheService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /** Call when a participant is added/removed (from the api side). */
-  async invalidate(conversationId: string): Promise<void> {
+  /**
+   * Call when a participant is added/removed (from the api side).
+   * Returns true on a successful DEL, false on a Redis failure. A false return
+   * is surfaced to the internal caller (see InvalidateController) so a stale
+   * cache isn't silently mistaken for a successful invalidation.
+   */
+  async invalidate(conversationId: string): Promise<boolean> {
     try {
       await this.redis.del(participantsCacheKey(conversationId));
       this.logger.log(`🗑️  Cache invalidated for ${conversationId}`);
+      return true;
     } catch (err) {
-      this.logger.warn(`⚠️ Cache invalidate failed (non-fatal): ${(err as Error).message}`);
+      this.logger.error(`❌ Cache invalidate failed: ${(err as Error).message}`);
+      return false;
     }
   }
 }

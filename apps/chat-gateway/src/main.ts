@@ -22,4 +22,9 @@ async function bootstrap() {
   await app.listen(port);
   logger.log(`🚀 Chat Gateway is running on ws://localhost:${port}`);
 }
-bootstrap();
+bootstrap().catch((err) => {
+  // A boot failure (bad secret, Cassandra init exhausted) must be a clean,
+  // logged exit — not an unhandled rejection.
+  console.error('Failed to start chat-gateway', err);
+  process.exit(1);
+});

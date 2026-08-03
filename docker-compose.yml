@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: admin
       POSTGRES_DB: chat_db
     ports:
-      - '5432:5432'
+      - '127.0.0.1:5432:5432'
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -22,7 +22,7 @@ services:
     container_name: chat_redis
     restart: unless-stopped
     ports:
-      - '6379:6379'
+      - '127.0.0.1:6379:6379'
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -34,7 +34,7 @@ services:
     container_name: chat_cassandra
     restart: unless-stopped
     ports:
-      - '9042:9042'
+      - '127.0.0.1:9042:9042'
     environment:
       - CASSANDRA_CLUSTER_NAME=ChatCluster
       - CASSANDRA_DC=datacenter1
@@ -58,7 +58,7 @@ services:
     container_name: chat_kafka
     restart: unless-stopped
     ports:
-      - '9092:9092'
+      - '127.0.0.1:9092:9092'
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller

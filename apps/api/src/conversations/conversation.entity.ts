@@ -31,6 +31,6 @@ export class Conversation {
   @UpdateDateColumn({ name: 'updated_at' })
   updatedAt: Date;
 
-  @OneToMany(() => ConversationParticipant, (cp) => cp.conversation)
+  @OneToMany(() => ConversationParticipant, (participant) => participant.conversation)
   participants: ConversationParticipant[];
 }

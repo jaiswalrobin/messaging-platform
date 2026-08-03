@@ -1,6 +1,4 @@
 import { Module } from '@nestjs/common';
-import { JwtModule } from '@nestjs/jwt';
-import { getJwtSecret, JWT_EXPIRES_IN } from '@chat/shared-types';
 import { CassandraService } from './cassandra.service';
 import { MessagesController } from './messages.controller';
 import { ParticipantsModule } from '../participants/participants.module';
@@ -8,10 +6,7 @@ import { UsersModule } from '../users/users.module';
 
 @Module({
   imports: [
-    JwtModule.register({
-      secret: getJwtSecret(),
-      signOptions: { expiresIn: JWT_EXPIRES_IN },
-    }),
+    // JwtService comes from the app.module global JwtModule.register (getJwtSecret() runs once).
     ParticipantsModule,
     // Provides the User mirror repository that HttpJwtGuard re-validates against
     UsersModule,

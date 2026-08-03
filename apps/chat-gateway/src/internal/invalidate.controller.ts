@@ -20,7 +20,7 @@ export class InvalidateController {
     if (!key || key !== getInternalApiKey()) {
       throw new UnauthorizedException('Invalid internal key');
     }
-    await this.participantCache.invalidate(conversationId);
-    return { status: 'ok' }; // 200 — the caller treats any non-throw as success
+    const ok = await this.participantCache.invalidate(conversationId);
+    return { status: ok ? 'ok' : 'failed' }; // 200 — the caller inspects status
   }
 }

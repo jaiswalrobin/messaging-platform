@@ -7,6 +7,16 @@ import { ParticipantCacheService } from '../participants/participant-cache.servi
 import { User } from '../users/user.entity';
 
 /**
+ * WS close code used when a connection is rejected for an authentication /
+ * policy violation (no token, invalid token, or the account no longer exists).
+ * 1008 = policy violation per RFC 6455.
+ */
+export const WS_CLOSE_POLICY_VIOLATION = 1008;
+
+/** WS close reason sent alongside WS_CLOSE_POLICY_VIOLATION on auth rejection. */
+export const WS_CLOSE_UNAUTHORIZED_REASON = 'Unauthorized';
+
+/**
  * Owns the connection registry (who is connected, on which sockets), the
  * heartbeat, connection lifecycle, and the broadcastToParticipants fan-out
  * helper used by both the producer handlers and the MSS consumer.
@@ -14,6 +24,12 @@ import { User } from '../users/user.entity';
 @Injectable()
 export class ConnectionRegistryService implements OnModuleDestroy {
   private readonly logger = new Logger(ConnectionRegistryService.name);
+
+  // Heartbeat cadence: ping every 15s, reap a socket after 2 missed pongs (~30s
+  // of silence) — 75% of the typical proxy idle timeout, so zombie sockets are
+  // reaped before they'd be counted as "online" and falsely receive fan-out.
+  private static readonly HEARTBEAT_INTERVAL_MS = 15000;
+  private static readonly MAX_MISSED_PONGS = 2;
 
   // In-memory connection registry: userId → Set of sockets (one per connected device)
   // Production: replace with Redis Connection Registry for multi-node routing
@@ -35,7 +51,7 @@ export class ConnectionRegistryService implements OnModuleDestroy {
    */
   attachServer(server: Server): void {
     server.on('connection', (ws) => {
-      (ws as any).isAlive = true;
+      (ws as any).missedPongs = 0;
       // Swallow socket-level errors (e.g. reset mid-close) — the readyState
       // guards in send()/broadcast keep dead sockets inert instead of crashing
       // the process on an unhandled 'error' event.
@@ -43,24 +59,24 @@ export class ConnectionRegistryService implements OnModuleDestroy {
         /* ignore */
       });
       ws.on('pong', () => {
-        (ws as any).isAlive = true;
+        (ws as any).missedPongs = 0;
       });
     });
 
     this.heartbeat = setInterval(() => {
       for (const ws of server.clients) {
-        if ((ws as any).isAlive === false) {
+        if ((ws as any).missedPongs >= ConnectionRegistryService.MAX_MISSED_PONGS) {
           ws.terminate();
           continue;
         }
-        (ws as any).isAlive = false;
+        (ws as any).missedPongs++;
         try {
           ws.ping();
         } catch {
           /* socket closed mid-check — terminated next round */
         }
       }
-    }, 30000);
+    }, ConnectionRegistryService.HEARTBEAT_INTERVAL_MS);
     this.heartbeat.unref();
   }
 
@@ -70,25 +86,25 @@ export class ConnectionRegistryService implements OnModuleDestroy {
 
   // ─── Connection lifecycle ───────────────────────────────────────────────────
 
-  /** Verify the ?token= query param and register the socket. Closes 1008 on failure. */
+  /** Verify the ?token= query param and register the socket. Closes WS_CLOSE_POLICY_VIOLATION on failure. */
   async handleConnection(client: any, request: any): Promise<void> {
     const url = new URL(request.url, 'http://localhost');
     const token = url.searchParams.get('token');
 
     if (!token) {
       this.logger.warn('❌ Rejected: no token');
-      client.close(1008, 'Unauthorized');
+      client.close(WS_CLOSE_POLICY_VIOLATION, WS_CLOSE_UNAUTHORIZED_REASON);
       return;
     }
 
     try {
-      const payload = this.jwtService.verify(token) as { sub: string; email?: string };
+      const jwtPayload = this.jwtService.verify(token) as { sub: string; email?: string };
 
       // Re-validate the account still exists in Postgres
-      const user = await this.userRepo.findOne({ where: { id: payload.sub } });
+      const user = await this.userRepo.findOne({ where: { id: jwtPayload.sub } });
       if (!user) {
-        this.logger.warn(`❌ Rejected: user ${payload.sub} no longer exists`);
-        client.close(1008, 'Unauthorized');
+        this.logger.warn(`❌ Rejected: user ${jwtPayload.sub} no longer exists`);
+        client.close(WS_CLOSE_POLICY_VIOLATION, WS_CLOSE_UNAUTHORIZED_REASON);
         return;
       }
 
@@ -96,34 +112,34 @@ export class ConnectionRegistryService implements OnModuleDestroy {
       // closed socket must never be registered (handleDisconnect already ran
       // and had no userId to clean up, so this would leak the dead socket).
       if (client.readyState !== WebSocket.OPEN) {
-        this.logger.log(`🔌 ${payload.sub} disconnected during handshake — not registered`);
+        this.logger.log(`🔌 ${jwtPayload.sub} disconnected during handshake — not registered`);
         return;
       }
 
       // Unify identity shape with HTTP: JWT { sub, email } → { userId, email }
-      client.user = { userId: payload.sub, email: payload.email };
+      client.user = { userId: jwtPayload.sub, email: jwtPayload.email };
       // Per-connection id so the gateway/consumer can target (or exclude) this
       // specific socket instead of the whole user (contract: (client as any).socketId)
       (client as any).socketId = crypto.randomUUID();
-      const set = this.connectedUsers.get(payload.sub) ?? new Set<WebSocket>();
-      set.add(client);
-      this.connectedUsers.set(payload.sub, set);
-      this.logger.log(`✅ Connected: ${payload.sub}`);
+      const userSockets = this.connectedUsers.get(jwtPayload.sub) ?? new Set<WebSocket>();
+      userSockets.add(client);
+      this.connectedUsers.set(jwtPayload.sub, userSockets);
+      this.logger.log(`✅ Connected: ${jwtPayload.sub}`);
     } catch {
       this.logger.warn('❌ Rejected: invalid token');
-      client.close(1008, 'Unauthorized');
+      client.close(WS_CLOSE_POLICY_VIOLATION, WS_CLOSE_UNAUTHORIZED_REASON);
     }
   }
 
   handleDisconnect(client: WebSocket): void {
     const userId = (client as any).user?.userId;
     if (userId) {
-      const set = this.connectedUsers.get(userId);
-      if (set) {
-        set.delete(client);
+      const userSockets = this.connectedUsers.get(userId);
+      if (userSockets) {
+        userSockets.delete(client);
         // Only drop the map entry when the last socket for this user closes,
         // otherwise device A's disconnect would ghost device B's mapping.
-        if (set.size === 0) {
+        if (userSockets.size === 0) {
           this.connectedUsers.delete(userId);
         }
       }
@@ -180,8 +196,8 @@ export class ConnectionRegistryService implements OnModuleDestroy {
     extra?: { clientMessageId?: string },
   ): Promise<boolean> {
     try {
-      const member = await this.participantCache.isMember(conversationId, userId);
-      if (!member) {
+      const isMember = await this.participantCache.isMember(conversationId, userId);
+      if (!isMember) {
         this.sendForbiddenFrame(client, conversationId, extra?.clientMessageId);
         return false;
       }

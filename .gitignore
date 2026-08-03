@@ -40,3 +40,6 @@ yarn-error.log*
 # Architecture design notes — private, NEVER commit (see CLAUDE.md)
 ARCHITECTURE.md
 arch*.md
+SYSTEM_DESIGN.md
+
+.claude/settings.local.json

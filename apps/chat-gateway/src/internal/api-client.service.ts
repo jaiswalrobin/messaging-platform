@@ -23,7 +23,7 @@ export class ApiClientService {
     lastReadMessageId: string,
   ): Promise<{ advanced: boolean } | null> {
     try {
-      const res = await fetch(
+      const response = await fetch(
         `http://${process.env.API_URL ?? 'localhost:3000'}/internal/conversations/${conversationId}/read`,
         {
           method: 'POST',
@@ -35,11 +35,11 @@ export class ApiClientService {
           signal: AbortSignal.timeout(2000),
         },
       );
-      if (!res.ok) {
-        this.logger.warn(`⚠️ api rejected mark_read (${res.status})`);
+      if (!response.ok) {
+        this.logger.warn(`⚠️ api rejected mark_read (${response.status})`);
         return null;
       }
-      return (await res.json()) as { advanced: boolean };
+      return (await response.json()) as { advanced: boolean };
     } catch (err) {
       this.logger.warn(`⚠️ api mark_read failed (non-fatal): ${(err as Error).message}`);
       return null;

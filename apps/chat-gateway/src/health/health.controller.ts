@@ -29,29 +29,39 @@ export class HealthController {
     redis: boolean;
     postgres: boolean;
   }> {
-    // Each probe resolves to a boolean; a 2s timeout turns a hung dependency into false.
-    const probe = (check: Promise<boolean>): Promise<boolean> =>
-      Promise.race([
-        check,
-        new Promise<boolean>((_, reject) =>
-          setTimeout(() => reject(new Error('probe timed out')), PROBE_TIMEOUT_MS),
-        ),
-      ]);
+    // Each probe resolves to a boolean; a 2s timeout turns a hung dependency into
+    // false. The timeout timer is cleared once the race settles so it can't leak.
+    const probe = (probePromise: Promise<boolean>): Promise<boolean> => {
+      let timer: NodeJS.Timeout;
+      return Promise.race([
+        probePromise,
+        new Promise<boolean>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('probe timed out')), PROBE_TIMEOUT_MS);
+        }),
+      ]).finally(() => clearTimeout(timer));
+    };
 
+    // kafkaService.isAvailable is a synchronous boolean read — it can't hang, so
+    // it doesn't need (or benefit from) the timeout race above.
     const allProbes = Promise.allSettled([
-      probe(Promise.resolve(this.kafkaService.isAvailable)),
+      Promise.resolve(this.kafkaService.isAvailable),
       probe(this.cassandraService.isHealthy()),
       probe(this.participantCacheService.isHealthy()),
       probe(this.dataSource.query('SELECT 1').then(() => true)),
-    ]).then((results) => results.map((r) => r.status === 'fulfilled' && r.value === true));
+    ]).then((results) =>
+      results.map((settlement) => settlement.status === 'fulfilled' && settlement.value === true),
+    );
 
-    // If the overall budget elapses, report every dependency down rather than hang the request.
-    const [kafka, cassandra, redis, postgres] = await Promise.race([
+    // If the overall budget elapses, report every dependency down rather than hang
+    // the request. Clear the budget timer once the race settles.
+    let overallTimer: NodeJS.Timeout;
+    const settled = await Promise.race([
       allProbes,
-      new Promise<boolean[]>((resolve) =>
-        setTimeout(() => resolve([false, false, false, false]), OVERALL_TIMEOUT_MS),
-      ),
-    ]);
+      new Promise<boolean[]>((resolve) => {
+        overallTimer = setTimeout(() => resolve([false, false, false, false]), OVERALL_TIMEOUT_MS);
+      }),
+    ]).finally(() => clearTimeout(overallTimer));
+    const [kafka, cassandra, redis, postgres] = settled;
 
     return {
       status: kafka && cassandra && redis && postgres ? 'ok' : 'degraded',
