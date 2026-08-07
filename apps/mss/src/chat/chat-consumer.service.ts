@@ -7,16 +7,19 @@ import type {
 } from '@chat/shared-types';
 import { CassandraService } from '../messages/cassandra.service';
 import { ApiClientService } from '../internal/api-client.service';
-import { ConnectionRegistryService } from './connection-registry.service';
-import { KafkaService } from '../kafka/kafka.service';
+import { ParticipantCacheService } from '../participants/participant-cache.service';
+import { DeliveryPublisherService } from './delivery-publisher.service';
+import { MssKafkaService } from '../kafka/mss-kafka.service';
 
 /**
- * MSS — Message Storage Service (the gateway's Kafka consumer role).
+ * MSS — Message Storage Service (the gateway's Kafka consumer role, extracted
+ * into its own service by the SRP split).
  *
- * In this single-node deployment the gateway is both producer and consumer:
- * ChatGateway publishes events to Kafka, this service consumes them — persisting
- * to Cassandra (durable source of truth) and routing frames to online clients
- * through the connection registry. The KafkaService's "never rethrow" bounded
+ * Consumes chat-events from Kafka: persists to Cassandra (durable source of
+ * truth), resolves recipients via the participant cache, and routes frames to
+ * online clients through the DeliveryPublisher (shared-registry pub/sub:
+ * registry lookup + targeted per-node channels — at-most-once, the FE backfill
+ * reconciles missed frames). The MssKafkaService's "never rethrow" bounded
  * retry wraps handleKafkaEvent, so failures here never crash the consumer.
  */
 @Injectable()
@@ -26,14 +29,19 @@ export class ChatConsumerService implements OnModuleInit {
   constructor(
     private readonly cassandraService: CassandraService,
     private readonly apiClient: ApiClientService,
-    private readonly registry: ConnectionRegistryService,
-    private readonly kafkaService: KafkaService,
+    private readonly participantCache: ParticipantCacheService,
+    private readonly deliveryPublisher: DeliveryPublisherService,
+    private readonly kafkaService: MssKafkaService,
   ) {}
 
   onModuleInit(): void {
-    // Register the final-skip handler. NOTE: the onEvent handler is registered
-    // by ChatGateway — a second onEvent registration would double-persist every
-    // message. This registry fires only for events the consumer gave up on.
+    // Register the consume handler for every Kafka event (the gateway's
+    // producer-side ChatGateway used to do this; in the split this service is
+    // the sole consumer, so it registers its own onEvent handler). NOTE: a
+    // second onEvent registration would double-persist every message.
+    this.kafkaService.onEvent((event) => this.handleKafkaEvent(event));
+    // Register the final-skip handler: fires only for events the consumer gave
+    // up on (after MAX_ATTEMPTS + DLQ publish).
     this.kafkaService.onEventSkipped((event) => this.onEventSkipped(event));
   }
 
@@ -45,7 +53,7 @@ export class ChatConsumerService implements OnModuleInit {
    */
   private async onEventSkipped(event: KafkaChatEvent): Promise<void> {
     if (event.type === 'MESSAGE_SENT') {
-      this.registry.sendToUserSockets(
+      await this.deliveryPublisher.publishToUser(
         event.senderId,
         'error',
         {
@@ -81,6 +89,18 @@ export class ChatConsumerService implements OnModuleInit {
     }
   }
 
+  /**
+   * All conversation participants except `excludeUserId` — mirrors the
+   * filtering chat-gateway's broadcastToParticipants applied before fan-out.
+   */
+  private async participantsExcept(
+    conversationId: string,
+    excludeUserId: string,
+  ): Promise<string[]> {
+    const participantIds = await this.participantCache.getParticipants(conversationId);
+    return participantIds.filter((id) => id !== excludeUserId);
+  }
+
   /** MSS: Persist message to Cassandra, route to online recipients; offline recipients are dropped (no queue yet). */
   private async onKafkaMessageSent(event: KafkaMessageSentPayload): Promise<void> {
     // 1. Persist to Cassandra (durable source of truth). This is the ONLY stage
@@ -104,8 +124,28 @@ export class ChatConsumerService implements OnModuleInit {
     //    sender "could not be saved" for a message that WAS saved (→ user resends
     //    → duplicate).
     try {
-      await this.registry.broadcastToParticipants(
-        event.conversationId,
+      const recipientIds = await this.participantsExcept(event.conversationId, event.senderId);
+      await this.deliveryPublisher.publishToUsers(recipientIds, 'message_received', {
+        messageId: event.messageId,
+        conversationId: event.conversationId,
+        senderId: event.senderId,
+        content: event.content,
+        createdAt: event.createdAt,
+      });
+    } catch (err) {
+      this.logger.error(
+        `⚠️  Recipient fan-out failed for ${event.messageId} (message already persisted): ${(err as Error).message}`,
+      );
+    }
+
+    // 3. Also route to the sender's OTHER devices, excluding the origin socket
+    // — it already got `message_sent`, and a second frame would duplicate the
+    // optimistic row the FE inserted. Best-effort for the same reason as the
+    // recipient fan-out: the message is already durable, so a routing failure
+    // must not rethrow into the retry → DLQ → PERSIST_FAILED path (the message
+    // WAS saved; surfacing PERSIST_FAILED would make the user resend → duplicate).
+    try {
+      await this.deliveryPublisher.publishToUser(
         event.senderId,
         'message_received',
         {
@@ -115,28 +155,13 @@ export class ChatConsumerService implements OnModuleInit {
           content: event.content,
           createdAt: event.createdAt,
         },
+        event.senderSocketId, // may be undefined for legacy events → sends to all sender sockets; FE dedupes by messageId
       );
     } catch (err) {
       this.logger.error(
-        `⚠️  Recipient fan-out failed for ${event.messageId} (message already persisted): ${(err as Error).message}`,
+        `⚠️  Sender fan-out failed for ${event.messageId} (message already persisted): ${(err as Error).message}`,
       );
     }
-
-    // 3. Also route to the sender's OTHER devices, excluding the origin socket
-    // — it already got `message_sent`, and a second frame would duplicate the
-    // optimistic row the FE inserted. (sendToUserSockets is synchronous.)
-    this.registry.sendToUserSockets(
-      event.senderId,
-      'message_received',
-      {
-        messageId: event.messageId,
-        conversationId: event.conversationId,
-        senderId: event.senderId,
-        content: event.content,
-        createdAt: event.createdAt,
-      },
-      event.senderSocketId, // may be undefined for legacy events → sends to all sender sockets; FE dedupes by messageId
-    );
   }
 
   /** MSS: Persist delivery receipt, route double grey tick to sender. */
@@ -173,9 +198,12 @@ export class ChatConsumerService implements OnModuleInit {
     // lost. Mirror the message_received fan-out handling in onKafkaMessageSent:
     // log the error, never rethrow.
     try {
-      await this.registry.broadcastToParticipants(
+      const recipientIdsExcludingAcker = await this.participantsExcept(
         event.conversationId,
         event.recipientId,
+      );
+      await this.deliveryPublisher.publishToUsers(
+        recipientIdsExcludingAcker,
         'message_delivered',
         {
           messageId: event.messageId,
@@ -233,9 +261,12 @@ export class ChatConsumerService implements OnModuleInit {
     // the api's markRead returning advanced:false (watermark already advanced)
     // and the blue-tick broadcast would be permanently lost. Log, never rethrow.
     try {
-      await this.registry.broadcastToParticipants(
+      const recipientIdsExcludingReader = await this.participantsExcept(
         event.conversationId,
         event.readerId,
+      );
+      await this.deliveryPublisher.publishToUsers(
+        recipientIdsExcludingReader,
         'message_read',
         {
           conversationId: event.conversationId,

@@ -16,12 +16,10 @@ import type {
   KafkaMessageDeliveredPayload,
   KafkaMessageReadPayload,
 } from '@chat/shared-types';
-import { CassandraService } from '../messages/cassandra.service';
 import { KafkaService } from '../kafka/kafka.service';
+import { EmergencyPersistService } from '../messages/emergency-persist.service';
 import { ConnectionRegistryService } from './connection-registry.service';
-import { ChatConsumerService } from './chat-consumer.service';
 import { SendMessageDto } from './dto/send-message.dto';
-import { FetchMessagesDto } from './dto/fetch-messages.dto';
 import { MarkReadDto } from './dto/mark-read.dto';
 import { MessageDeliveredDto } from './dto/message-delivered.dto';
 import { types } from 'cassandra-driver';
@@ -43,8 +41,10 @@ const FUTURE_SKEW_MS = 60000;
 
 /**
  * WS producer handlers. Connection lifecycle, heartbeat and fan-out live in
- * ConnectionRegistryService; the Kafka consumer (MSS) role lives in
- * ChatConsumerService. Incoming WebSocket event DTOs are validated using NestJS ValidationPipe.
+ * ConnectionRegistryService. The gateway is producer-only under the SRP split:
+ * consumption, persistence and receipt routing (the MSS role) live in the
+ * separate `mss` service, which consumes chat-events from Kafka. Incoming
+ * WebSocket event DTOs are validated using NestJS ValidationPipe.
  */
 @UsePipes(new ValidationPipe({ transform: true }))
 @WebSocketGateway({ cors: true })
@@ -55,18 +55,12 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
   private readonly logger = new Logger(ChatGateway.name);
 
   constructor(
-    private readonly cassandraService: CassandraService,
     private readonly kafkaService: KafkaService,
     private readonly registry: ConnectionRegistryService,
-    private readonly consumer: ChatConsumerService,
+    private readonly emergencyPersist: EmergencyPersistService,
   ) {}
 
-  // ─── Module Init & Heartbeat ────────────────────────────────────────────────
-
-  onModuleInit() {
-    // Register the MSS consumer (ChatConsumerService) as the Kafka event handler
-    this.kafkaService.onEvent((event) => this.consumer.handleKafkaEvent(event));
-  }
+  // ─── Heartbeat ─────────────────────────────────────────────────────────────
 
   afterInit() {
     // Heartbeat wiring lives in the registry — it owns the socket lifecycle
@@ -107,7 +101,6 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
     this.logger.log(`📨 Message from ${senderId} → conversation ${data.conversationId}`);
 
     // ── Step 1: Publish MESSAGE_SENT to Kafka ───────────────────────────────
-    // One payload, reused for both the Kafka publish and the direct fallback.
     const kafkaPayload: KafkaMessageSentPayload = {
       type: 'MESSAGE_SENT',
       messageId,
@@ -121,7 +114,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
 
     const isPublished = await this.kafkaService.publish(kafkaPayload);
 
-    // ── Step 2: ACK sender immediately after Kafka ACK (or direct mode) ────
+    // ── Step 2: ACK sender after Kafka ACK ──────────────────────────────────
     if (isPublished) {
       // Kafka-first: Kafka ACK received → send single tick to sender
       this.registry.send(client, 'message_sent', {
@@ -135,16 +128,52 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
       });
       this.logger.log(`✅ Kafka ACK received, message_sent dispatched for ${messageId}`);
     } else {
-      // Fallback (no Kafka): persist directly and deliver inline
-      this.logger.warn(`⚠️  Kafka unavailable — falling back to direct delivery for ${messageId}`);
+      // Degraded SRP exception — broker-down only: the gateway normally never
+      // touches Cassandra (mss owns it), but with Kafka down nothing persists
+      // the message, so we insert directly to keep sends working (NFR-3).
       try {
-        await this.directPersistAndDeliver(kafkaPayload, client);
-      } catch (err) {
-        // Direct-mode persist failure — surface it. (In Kafka mode persistence
-        // is async in the consumer, so PERSIST_FAILED is direct-mode only.)
-        this.logger.error(
-          `💥 Direct persist failed for ${messageId}: ${(err as Error).message}`,
+        await this.emergencyPersist.saveMessage(
+          data.conversationId,
+          senderId,
+          data.content,
+          messageId,
+          new Date(createdAt),
         );
+        // sender tick + local fan-out (recipients this node holds) + sender's other devices
+        this.registry.send(client, 'message_sent', {
+          messageId,
+          conversationId: data.conversationId,
+          senderId,
+          content: data.content,
+          createdAt,
+          clientMessageId: data.clientMessageId,
+          status: 'sent',
+        });
+        await this.registry.broadcastToParticipants(
+          data.conversationId,
+          senderId,
+          'message_received',
+          {
+            messageId,
+            conversationId: data.conversationId,
+            senderId,
+            content: data.content,
+            createdAt,
+          },
+        );
+        this.registry.sendToUserSockets(
+          senderId,
+          'message_received',
+          {
+            messageId,
+            conversationId: data.conversationId,
+            senderId,
+            content: data.content,
+            createdAt,
+          },
+          (client as any).socketId,
+        );
+      } catch (err) {
         this.registry.send(client, 'error', {
           code: 'PERSIST_FAILED',
           message: 'Message could not be saved',
@@ -265,145 +294,5 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
       );
     }
     // MSS consumer will persist receipt and notify sender
-  }
-
-  // ─── WS: Fetch Message History ─────────────────────────────────────────────
-
-  @UseGuards(WsAuthGuard)
-  @SubscribeMessage('fetch_messages')
-  async handleFetchMessages(
-    @ConnectedSocket() client: WebSocket,
-    @MessageBody() data: FetchMessagesDto,
-  ): Promise<void> {
-    const userId: string = (client as any).user.userId;
-    // Limit is already capped by FetchMessagesDto (@Max(MAX_HISTORY_LIMIT))
-    const limit = data.limit ?? 20;
-    this.logger.log(`📜 Fetching last ${limit} messages for conversation ${data.conversationId}`);
-
-    // Membership check before fetching history (IDOR prevention)
-    const isMember = await this.registry.requireMember(data.conversationId, userId, client);
-    if (!isMember) {
-      return;
-    }
-
-    try {
-      const messages = await this.cassandraService.getMessages(data.conversationId, limit);
-
-      // Attach per-message receipt state so history hydrates gray/blue ticks on
-      // reload. Best-effort: if the receipt query fails, fall back to empty
-      // receipt arrays rather than failing the whole fetch.
-      let receiptsByMessage: Record<string, Array<{ userId: string; status: 'delivered' | 'read' }>> = {};
-      try {
-        const ids = messages.map((message: { id: string }) => message.id);
-        receiptsByMessage = await this.cassandraService.getReceiptsForMessages(
-          data.conversationId,
-          ids,
-        );
-      } catch (err) {
-        this.logger.warn(
-          `⚠️  Failed to fetch receipts for ${data.conversationId}: ${(err as Error).message} — returning history without receipt state`,
-        );
-      }
-
-      const messagesWithReceipts = messages.map((message: { id: string }) => ({
-        ...message,
-        receipts: receiptsByMessage[message.id] ?? [],
-      }));
-
-      this.registry.send(client, 'messages_history', {
-        conversationId: data.conversationId,
-        messages: messagesWithReceipts,
-      });
-    } catch (err) {
-      this.logger.error(
-        `💥 Failed to fetch messages for ${data.conversationId}: ${(err as Error).message}`,
-      );
-      this.registry.send(client, 'error', {
-        code: 'FETCH_FAILED',
-        message: 'Failed to fetch messages',
-        conversationId: data.conversationId,
-      });
-    }
-  }
-
-  // ─── Fallback: Direct Persist & Deliver (no Kafka) ─────────────────────────
-
-  /**
-   * Broker-down fallback for `message` events: persist to Cassandra and deliver
-   * inline, bypassing the MSS consumer.
-   *
-   * NOTE: direct mode does NOT produce delivery receipts. Nothing is persisted to
-   * message_receipts here, so the sender's gray/blue ticks come only from real
-   * app-level acks routed through the Kafka consumer — with Kafka down, receipts
-   * are dead until the broker recovers (the FE still matches its own messages by
-   * messageId, or by clientMessageId in direct-fallback mode).
-   *
-   * Only saveMessage's failure is a real failure here: the message WAS persisted,
-   * so any post-persist fan-out error must be swallowed, not propagated — if it
-   * reached handleMessage's catch it would send PERSIST_FAILED for a message that
-   * WAS saved, prompting the user to resend (a duplicate).
-   */
-  private async directPersistAndDeliver(
-    event: KafkaMessageSentPayload,
-    senderSocket: WebSocket,
-  ): Promise<void> {
-    await this.cassandraService.saveMessage(
-      event.conversationId,
-      event.senderId,
-      event.content,
-      event.messageId,
-      new Date(event.createdAt),
-      event.clientMessageId,
-    );
-
-    // Post-persist fan-out is best-effort. The message is durable in Cassandra,
-    // so a failure here means at worst that an online recipient misses the live
-    // frame and recovers on reload. Swallow and log rather than let it reach
-    // handleMessage's PERSIST_FAILED path (a message that WAS saved must never be
-    // reported as "could not be saved", which would trigger a duplicate resend).
-    try {
-      this.registry.send(senderSocket, 'message_sent', {
-        messageId: event.messageId,
-        conversationId: event.conversationId,
-        senderId: event.senderId,
-        content: event.content,
-        createdAt: event.createdAt,
-        clientMessageId: event.clientMessageId,
-        status: 'sent',
-      });
-
-      // Fan out message_received to online recipients (offline → dropped, no queue)
-      await this.registry.broadcastToParticipants(
-        event.conversationId,
-        event.senderId,
-        'message_received',
-        {
-          messageId: event.messageId,
-          conversationId: event.conversationId,
-          senderId: event.senderId,
-          content: event.content,
-          createdAt: event.createdAt,
-        },
-      );
-
-      // Sender's other devices also get the message; the origin socket already got
-      // `message_sent` (a second frame would duplicate the optimistic row).
-      this.registry.sendToUserSockets(
-        event.senderId,
-        'message_received',
-        {
-          messageId: event.messageId,
-          conversationId: event.conversationId,
-          senderId: event.senderId,
-          content: event.content,
-          createdAt: event.createdAt,
-        },
-        (senderSocket as any).socketId,
-      );
-    } catch (err) {
-      this.logger.error(
-        `⚠️  Direct-delivery fan-out failed for ${event.messageId} (message already persisted): ${(err as Error).message}`,
-      );
-    }
   }
 }

@@ -113,3 +113,23 @@ export interface UserAuthResponse {
   userId: string;
   token: string;
 }
+
+// ── SRP split: connection registry & delivery frames ─────────────────────────
+
+export interface DeliveryFrame {
+  /** WS event name the target node should emit ('message_received' | 'message_delivered' | 'message_read' | 'error'). */
+  event: string;
+  /** The frame payload exactly as the client expects it (same shape as today's direct sends). */
+  data: unknown;
+  /** Whose sockets the target node should write to. */
+  userId: string;
+  /** Origin-socket exclusion: the target node must skip the socket with this id. */
+  excludeSocketId?: string;
+}
+
+/** Redis key prefix for the shared connection registry: registry:user:{userId} is a HASH {socketId → nodeId}. */
+export const REGISTRY_KEY_PREFIX = 'registry:user:';
+/** Redis channel prefix for delivery frames: delivery:{nodeId} — each gateway subscribes ONLY to its own. */
+export const DELIVERY_CHANNEL_PREFIX = 'delivery:';
+/** TTL for registry entries, refreshed by the gateway's 30s heartbeat (WhatsApp's 90s-TTL pattern). */
+export const REGISTRY_TTL_SECONDS = 90;

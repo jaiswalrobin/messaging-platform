@@ -5,9 +5,10 @@ A WhatsApp/Discord-style real-time chat backend — a pnpm + Turborepo monorepo 
 | Service | Port | Protocol | Responsibility |
 |---|---|---|---|
 | `apps/api` | 3000 | HTTP (REST) | Auth, JWT, user search, conversation & group management |
-| `apps/chat-gateway` | 8080 | HTTP + WebSocket | Live connections, message persistence (Cassandra), routing, fan-out, delivery receipts, history |
+| `apps/chat-gateway` | 8080 | HTTP + WebSocket | Producer + connection holder: WS accept/auth/membership, publish events to Kafka, sender tick, shared-registry registration, delivery-frame subscriber |
+| `apps/mss` | 8081 | HTTP + Kafka consumer | Consumer (MSS role): consumes `chat-events`, owns Cassandra (messages + receipts), registry-lookup + targeted Redis pub/sub delivery, api watermark calls, DLQ |
 
-**Data stores:** PostgreSQL 15 (metadata) · Cassandra 4.1 (messages + receipts) · Redis 7 (participant cache) · Kafka 3.9 / KRaft (event log — the Kafka-first send + receipts pipeline).
+**Data stores:** PostgreSQL 15 (metadata, owner: api) · Cassandra 4.1 (messages + receipts, owner: **mss**) · Redis 7 (participant cache + shared connection registry — written by gateway, read by mss) · Kafka 3.9 / KRaft (event log).
 
 > Full technical reference: [ARCHITECTURE.md](ARCHITECTURE.md)
 
@@ -26,7 +27,7 @@ pnpm install
 # 2. Start the infrastructure (postgres, redis, cassandra, kafka)
 docker compose up -d
 
-# 3. Start both apps
+# 3. Start all apps (api, chat-gateway, mss)
 pnpm dev
 ```
 
@@ -50,22 +51,24 @@ docker compose ps          # wait until all 4 show "healthy"
 ```
 *(If using colima, run `colima start` first.)*
 
-**4. Start the backend services** (api :3000 + chat-gateway :8080)
+**4. Start the backend services** (api :3000, chat-gateway :8080, mss :8081)
 ```bash
-pnpm dev                   # turbo runs both together (watch mode)
+pnpm dev                   # turbo runs all three together (watch mode)
 ```
-…or run them separately in two terminals:
+…or run them separately in three terminals:
 ```bash
 pnpm --filter api start:dev
 pnpm --filter chat-gateway start:dev
+pnpm --filter mss start:dev
 ```
 
 **5. Verify everything is running**
 ```bash
 curl -s localhost:3000/health   # {"status":"ok",...,"postgres":true}
-curl -s localhost:8080/health   # {"status":"ok","kafkaAvailable":true,"cassandra":true,"redis":true,"postgres":true}
+curl -s localhost:8080/health   # {"status":"ok","kafkaAvailable":true,"redis":true,"postgres":true}
+curl -s localhost:8081/health   # {"status":"ok","service":"mss","cassandra":true,"redis":true,"kafka":true}
 ```
-On boot the gateway auto-creates the Cassandra schema (`chat_ks` + `messages`/`message_receipts`) and the Kafka topics (`chat-events`, `chat-events-dlq`).
+On boot the gateway auto-creates the Kafka topics (`chat-events`, `chat-events-dlq`); **mss** owns the Cassandra schema (`chat_ks` + `messages`/`message_receipts`), created on its boot.
 
 **6. Run the frontend** (separate repo, `messaging-web`)
 ```bash

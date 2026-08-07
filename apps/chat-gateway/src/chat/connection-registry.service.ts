@@ -4,6 +4,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { WebSocket, Server } from 'ws';
 import { ParticipantCacheService } from '../participants/participant-cache.service';
+import { RegistryService } from './registry.service';
 import { User } from '../users/user.entity';
 
 /**
@@ -19,7 +20,8 @@ export const WS_CLOSE_UNAUTHORIZED_REASON = 'Unauthorized';
 /**
  * Owns the connection registry (who is connected, on which sockets), the
  * heartbeat, connection lifecycle, and the broadcastToParticipants fan-out
- * helper used by both the producer handlers and the MSS consumer.
+ * helper used by the producer handlers and the delivery subscriber (the MSS
+ * consumer lives in the separate `mss` service and fans out via the Redis bus).
  */
 @Injectable()
 export class ConnectionRegistryService implements OnModuleDestroy {
@@ -31,8 +33,9 @@ export class ConnectionRegistryService implements OnModuleDestroy {
   private static readonly HEARTBEAT_INTERVAL_MS = 15000;
   private static readonly MAX_MISSED_PONGS = 2;
 
-  // In-memory connection registry: userId → Set of sockets (one per connected device)
-  // Production: replace with Redis Connection Registry for multi-node routing
+  // Local delivery map: userId → Set of sockets (one per connected device).
+  // Authoritative for THIS node's fan-out; the shared Redis registry
+  // (RegistryService) mirrors it for cross-node routing.
   private connectedUsers = new Map<string, Set<WebSocket>>();
 
   private heartbeat: NodeJS.Timeout;
@@ -40,12 +43,13 @@ export class ConnectionRegistryService implements OnModuleDestroy {
   constructor(
     private readonly jwtService: JwtService,
     private readonly participantCache: ParticipantCacheService,
+    private readonly registryService: RegistryService,
     @InjectRepository(User)
     private readonly userRepo: Repository<User>,
   ) {}
 
   /**
-   * Wire the 30s heartbeat. The heartbeat lives here — not in the gateway —
+   * Wire the heartbeat. The heartbeat lives here — not in the gateway —
    * because the registry owns the socket lifecycle; the gateway hands over its
    * @WebSocketServer() instance from afterInit.
    */
@@ -74,6 +78,12 @@ export class ConnectionRegistryService implements OnModuleDestroy {
           ws.ping();
         } catch {
           /* socket closed mid-check — terminated next round */
+        }
+        // Still-alive socket → keep the shared-registry entry for its user
+        // alive (best-effort EXPIRE; refresh() logs internally, never throws).
+        const userId = (ws as any).user?.userId;
+        if (userId) {
+          this.registryService.refresh(userId);
         }
       }
     }, ConnectionRegistryService.HEARTBEAT_INTERVAL_MS);
@@ -125,6 +135,19 @@ export class ConnectionRegistryService implements OnModuleDestroy {
       userSockets.add(client);
       this.connectedUsers.set(jwtPayload.sub, userSockets);
       this.logger.log(`✅ Connected: ${jwtPayload.sub}`);
+
+      // Shared-registry write path: publish this socket to Redis so other
+      // nodes can route to it. Best-effort and never allowed to break the
+      // handshake (register() catches internally; the try/catch is defensive
+      // against a future change and the outer catch would otherwise misreport
+      // a registration hiccup as an invalid token and close the socket).
+      try {
+        await this.registryService.register(jwtPayload.sub, (client as any).socketId);
+      } catch (err) {
+        this.logger.warn(
+          `⚠️ Registry registration skipped for ${jwtPayload.sub}: ${(err as Error).message}`,
+        );
+      }
     } catch {
       this.logger.warn('❌ Rejected: invalid token');
       client.close(WS_CLOSE_POLICY_VIOLATION, WS_CLOSE_UNAUTHORIZED_REASON);
@@ -144,6 +167,11 @@ export class ConnectionRegistryService implements OnModuleDestroy {
         }
       }
       this.logger.log(`🔌 Disconnected: ${userId}`);
+
+      // Shared-registry write path: drop this socket's entry. Best-effort and
+      // never throws (unregister() catches internally) — a stale entry just
+      // expires via TTL, so no await needed on the disconnect path.
+      this.registryService.unregister(userId, (client as any).socketId);
     }
   }
 

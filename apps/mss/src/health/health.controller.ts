@@ -1,30 +1,28 @@
 import { Controller, Get } from '@nestjs/common';
-import { InjectDataSource } from '@nestjs/typeorm';
-import { DataSource } from 'typeorm';
-import { KafkaService } from '../kafka/kafka.service';
+import { MssKafkaService } from '../kafka/mss-kafka.service';
+import { CassandraService } from '../messages/cassandra.service';
 import { ParticipantCacheService } from '../participants/participant-cache.service';
 
 // Per-dependency probe timeout; a hung dependency must not hang /health.
 const PROBE_TIMEOUT_MS = 2000;
-// Overall budget so the three concurrent probes can't stall past ~2.5s.
+// Overall budget so the concurrent probes can't stall past ~2.5s.
 const OVERALL_TIMEOUT_MS = 2500;
 
 @Controller('health')
 export class HealthController {
   constructor(
-    private readonly kafkaService: KafkaService,
+    private readonly kafkaService: MssKafkaService,
+    private readonly cassandraService: CassandraService,
     private readonly participantCacheService: ParticipantCacheService,
-    @InjectDataSource() private readonly dataSource: DataSource,
   ) {}
 
   @Get()
   async check(): Promise<{
     status: 'ok' | 'degraded';
     service: string;
-    uptime: number;
-    kafkaAvailable: boolean;
+    cassandra: boolean;
     redis: boolean;
-    postgres: boolean;
+    kafka: boolean;
   }> {
     // Each probe resolves to a boolean; a 2s timeout turns a hung dependency into
     // false. The timeout timer is cleared once the race settles so it can't leak.
@@ -39,12 +37,11 @@ export class HealthController {
     };
 
     // kafkaService.isAvailable is a synchronous boolean read — it can't hang, so
-    // it doesn't need (or benefit from) the timeout race above. Cassandra is not
-    // probed: under the SRP split the gateway no longer owns it (mss does).
+    // it doesn't need (or benefit from) the timeout race above.
     const allProbes = Promise.allSettled([
       Promise.resolve(this.kafkaService.isAvailable),
+      probe(this.cassandraService.isHealthy()),
       probe(this.participantCacheService.isHealthy()),
-      probe(this.dataSource.query('SELECT 1').then(() => true)),
     ]).then((results) =>
       results.map((settlement) => settlement.status === 'fulfilled' && settlement.value === true),
     );
@@ -58,15 +55,14 @@ export class HealthController {
         overallTimer = setTimeout(() => resolve([false, false, false]), OVERALL_TIMEOUT_MS);
       }),
     ]).finally(() => clearTimeout(overallTimer));
-    const [kafka, redis, postgres] = settled;
+    const [kafka, cassandra, redis] = settled;
 
     return {
-      status: kafka && redis && postgres ? 'ok' : 'degraded',
-      service: 'chat-gateway',
-      uptime: process.uptime(),
-      kafkaAvailable: kafka,
+      status: kafka && cassandra && redis ? 'ok' : 'degraded',
+      service: 'mss',
+      cassandra,
       redis,
-      postgres,
+      kafka,
     };
   }
 }

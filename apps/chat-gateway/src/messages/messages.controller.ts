@@ -1,64 +1,57 @@
 import {
+  BadGatewayException,
   Controller,
-  Get,
-  Param,
-  Query,
-  ParseIntPipe,
   DefaultValuePipe,
-  UseGuards,
-  Req,
-  ForbiddenException,
+  Get,
+  Headers,
   Logger,
+  Param,
+  ParseIntPipe,
+  Query,
 } from '@nestjs/common';
-import { CassandraService, MessageRecord } from './cassandra.service';
-import { ParticipantCacheService } from '../participants/participant-cache.service';
-import { HttpJwtGuard } from '../auth/http-jwt.guard';
 import { MAX_HISTORY_LIMIT } from '@chat/shared-types';
 
+/**
+ * THIN PROXY to the mss service (the Cassandra owner under the SRP split). The
+ * gateway no longer reads message storage: JWT auth, membership checks and
+ * receipt hydration all happen in mss. The incoming Authorization header is
+ * forwarded untouched so mss can authenticate the caller.
+ */
 @Controller('messages')
 export class MessagesController {
   private readonly logger = new Logger(MessagesController.name);
 
-  constructor(
-    private readonly cassandraService: CassandraService,
-    private readonly participantCache: ParticipantCacheService,
-  ) {}
-
-  @UseGuards(HttpJwtGuard)
   @Get(':conversationId')
   async getMessages(
     @Param('conversationId') conversationId: string,
     @Query('limit', new DefaultValuePipe(20), ParseIntPipe) limit: number,
-    @Req() request: { user: { userId: string } },
-  ): Promise<{
-    conversationId: string;
-    messages: Array<MessageRecord & { receipts: { userId: string; status: 'delivered' | 'read' }[] }>;
-  }> {
-    // Reject non-members before exposing any conversation history (IDOR prevention)
-    const isMember = await this.participantCache.isMember(conversationId, request.user.userId);
-    if (!isMember) {
-      throw new ForbiddenException('Not a member of this conversation');
-    }
-
+    @Headers('authorization') authorization?: string,
+  ): Promise<{ conversationId: string; messages: Array<Record<string, unknown>> }> {
+    const mssUrl = process.env.MSS_URL ?? 'localhost:8081';
     const safeLimit = Math.max(1, Math.min(limit, MAX_HISTORY_LIMIT));
-    const messages = await this.cassandraService.getMessages(conversationId, safeLimit);
 
-    // Attach per-message receipt state so reloads hydrate accurate sent/delivered
-    // ticks (the FE's history source is this REST endpoint). Best-effort: a
-    // receipt-query failure falls back to empty arrays rather than failing history.
-    let receiptsByMessage: Record<string, Array<{ userId: string; status: 'delivered' | 'read' }>> = {};
-    try {
-      const ids = messages.map((message) => message.id);
-      receiptsByMessage = await this.cassandraService.getReceiptsForMessages(conversationId, ids);
-    } catch (err) {
-      this.logger.warn(
-        `⚠️  Failed to fetch receipts for ${conversationId}: ${(err as Error).message} — returning history without receipt state`,
-      );
+    const headers: Record<string, string> = {};
+    if (authorization) {
+      headers.authorization = authorization;
     }
-    const messagesWithReceipts = messages.map((message) => ({
-      ...message,
-      receipts: receiptsByMessage[message.id] ?? [],
-    }));
-    return { conversationId, messages: messagesWithReceipts };
+
+    try {
+      const response = await fetch(
+        `http://${mssUrl}/messages/${conversationId}?limit=${safeLimit}`,
+        { headers, signal: AbortSignal.timeout(5000) },
+      );
+      if (!response.ok) {
+        throw new Error(`mss responded with ${response.status}`);
+      }
+      return (await response.json()) as {
+        conversationId: string;
+        messages: Array<Record<string, unknown>>;
+      };
+    } catch (err) {
+      this.logger.error(
+        `❌ mss history proxy failed for ${conversationId}: ${(err as Error).message}`,
+      );
+      throw new BadGatewayException('Message history service unavailable');
+    }
   }
 }
