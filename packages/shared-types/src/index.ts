@@ -94,6 +94,14 @@ export interface KafkaMessageDeliveredPayload {
   conversationId: string;
   recipientId: string;
   deliveredAt: string;
+  /**
+   * Original sender of the message — needed by the mss consumer to compute the
+   * "all delivered" verdict (recipients = participantsExcept(senderId)). The
+   * recipient's client carries it across the WS frame so the gateway can echo
+   * it to Kafka without an extra lookup. Required for the all-delivered tick
+   * semantics; the consumer rejects events lacking it.
+   */
+  senderId: string;
 }
 
 export interface KafkaMessageReadPayload {

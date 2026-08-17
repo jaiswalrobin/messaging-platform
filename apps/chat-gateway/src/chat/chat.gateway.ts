@@ -48,7 +48,9 @@ const FUTURE_SKEW_MS = 60000;
  */
 @UsePipes(new ValidationPipe({ transform: true }))
 @WebSocketGateway({ cors: true })
-export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, OnGatewayInit {
+export class ChatGateway
+  implements OnGatewayConnection, OnGatewayDisconnect, OnGatewayInit
+{
   @WebSocketServer()
   server: Server;
 
@@ -88,9 +90,14 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
     const senderId: string = (client as any).user.userId;
 
     // ── Step 0: Membership check (IDOR prevention) ─────────────────────────
-    const isMember = await this.registry.requireMember(data.conversationId, senderId, client, {
-      clientMessageId: data.clientMessageId,
-    });
+    const isMember = await this.registry.requireMember(
+      data.conversationId,
+      senderId,
+      client,
+      {
+        clientMessageId: data.clientMessageId,
+      },
+    );
     if (!isMember) {
       return;
     }
@@ -98,7 +105,9 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
     const messageId = types.TimeUuid.now().toString();
     const createdAt = new Date().toISOString();
 
-    this.logger.log(`📨 Message from ${senderId} → conversation ${data.conversationId}`);
+    this.logger.log(
+      `📨 Message from ${senderId} → conversation ${data.conversationId}`,
+    );
 
     // ── Step 1: Publish MESSAGE_SENT to Kafka ───────────────────────────────
     const kafkaPayload: KafkaMessageSentPayload = {
@@ -126,7 +135,9 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
         clientMessageId: data.clientMessageId,
         status: 'sent',
       });
-      this.logger.log(`✅ Kafka ACK received, message_sent dispatched for ${messageId}`);
+      this.logger.log(
+        `✅ Kafka ACK received, message_sent dispatched for ${messageId}`,
+      );
     } else {
       // Degraded SRP exception — broker-down only: the gateway normally never
       // touches Cassandra (mss owns it), but with Kafka down nothing persists
@@ -195,14 +206,20 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
     const recipientId: string = (client as any).user.userId;
 
     // Membership check before recording anything (IDOR prevention)
-    const isMember = await this.registry.requireMember(data.conversationId, recipientId, client);
+    const isMember = await this.registry.requireMember(
+      data.conversationId,
+      recipientId,
+      client,
+    );
     if (!isMember) {
       return;
     }
 
     const deliveredAt = new Date().toISOString();
 
-    this.logger.log(`📬 Delivery ACK from ${recipientId} for message ${data.messageId}`);
+    this.logger.log(
+      `📬 Delivery ACK from ${recipientId} for message ${data.messageId}`,
+    );
 
     const kafkaPayload: KafkaMessageDeliveredPayload = {
       type: 'MESSAGE_DELIVERED',
@@ -210,6 +227,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
       conversationId: data.conversationId,
       recipientId,
       deliveredAt,
+      senderId: data.senderId,
     };
 
     const isPublished = await this.kafkaService.publish(kafkaPayload);
@@ -233,7 +251,11 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
     const readerId: string = (client as any).user.userId;
 
     // Membership check before recording anything (IDOR prevention)
-    const isMember = await this.registry.requireMember(data.conversationId, readerId, client);
+    const isMember = await this.registry.requireMember(
+      data.conversationId,
+      readerId,
+      client,
+    );
     if (!isMember) {
       return;
     }
@@ -275,7 +297,9 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, On
 
     const readAt = new Date().toISOString();
 
-    this.logger.log(`👁️  mark_read from ${readerId} in conversation ${data.conversationId} up to ${data.lastReadMessageId}`);
+    this.logger.log(
+      `👁️  mark_read from ${readerId} in conversation ${data.conversationId} up to ${data.lastReadMessageId}`,
+    );
 
     const kafkaPayload: KafkaMessageReadPayload = {
       type: 'MESSAGE_READ',

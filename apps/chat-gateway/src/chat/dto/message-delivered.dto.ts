@@ -17,4 +17,14 @@ export class MessageDeliveredDto {
   @IsString()
   @IsNotEmpty()
   messageId: string;
+
+  /**
+   * Original sender of the message. The recipient's client carries it from the
+   * `message_received` frame it already received — without it the mss consumer
+   * can't compute the "all delivered" verdict (it needs to know who is excluded
+   * from the recipient set). Required.
+   */
+  @IsString()
+  @IsNotEmpty()
+  senderId: string;
 }

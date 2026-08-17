@@ -166,6 +166,18 @@ export class ChatConsumerService implements OnModuleInit {
 
   /** MSS: Persist delivery receipt, route double grey tick to sender. */
   private async onKafkaMessageDelivered(event: KafkaMessageDeliveredPayload): Promise<void> {
+    // senderId is required for the all-delivered verdict (recipients = everyone
+    // except the sender). Events lacking it come from a pre-feature producer or
+    // a buggy client — reject loudly so they don't silently get first-wins
+    // behaviour. The broadcast is the cheap part; the verdict is the reason
+    // we're here.
+    if (!event.senderId) {
+      this.logger.warn(
+        `⚠️  MESSAGE_DELIVERED missing senderId for ${event.messageId} from ${event.recipientId} — skipped (all-delivered verdict requires senderId)`,
+      );
+      return;
+    }
+
     // Dedupe: a recipient's second device (or a re-delivered event) must not
     // re-broadcast the receipt. Read-before-write; the worst-case race
     // re-broadcasts once, which the FE's upgrade-only handler dedupes anyway.
@@ -190,6 +202,33 @@ export class ChatConsumerService implements OnModuleInit {
       'delivered',
     );
 
+    // Re-read AFTER the insert so the count includes this ack AND any
+    // concurrent commits that landed between our dedup read and this re-read.
+    // Reading BEFORE the insert would race with concurrent inserts — both
+    // callers would see the same count, both would compute the same wrong
+    // verdict, and the last ack would never be observed. The re-read is
+    // sub-millisecond (single partition, narrow clustering slice) and the
+    // price of correctness for concurrent acks.
+    const receiptsAfter = await this.cassandraService.getReceipts(
+      event.conversationId,
+      event.messageId,
+    );
+    const deliveredBy = new Set(
+      receiptsAfter
+        .filter((receipt) => receipt.status === 'delivered' || receipt.status === 'read')
+        .map((receipt) => receipt.userId),
+    );
+
+    // recipients = everyone except the original sender (sender's own devices
+    // are not recipients of the message). For single-sender/zero-recipient
+    // conversations the verdict is trivially true — but the FE still wants
+    // the broadcast for the "sender's other devices" symmetry (e.g. Alice's
+    // MacBook receiving the allDelivered event so applyRead can later flip
+    // it to 'read'). Compute against real length so 'all delivered' is
+    // meaningful only when there's actually someone to wait for.
+    const recipients = await this.participantsExcept(event.conversationId, event.senderId);
+    const allDelivered = recipients.length > 0 && recipients.every((id) => deliveredBy.has(id));
+
     // Route status update to all participants except the acker (sender included).
     // The FE upgrades only its own outgoing messages, matched by messageId.
     // Best-effort: the receipt row is already persisted above, so a transient
@@ -211,6 +250,7 @@ export class ChatConsumerService implements OnModuleInit {
           recipientId: event.recipientId,
           deliveredAt: event.deliveredAt,
           status: 'delivered',
+          allDelivered,
         },
       );
     } catch (err) {
