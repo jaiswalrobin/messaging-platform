@@ -221,28 +221,26 @@ export class ChatConsumerService implements OnModuleInit {
 
     // recipients = everyone except the original sender (sender's own devices
     // are not recipients of the message). For single-sender/zero-recipient
-    // conversations the verdict is trivially true — but the FE still wants
-    // the broadcast for the "sender's other devices" symmetry (e.g. Alice's
-    // MacBook receiving the allDelivered event so applyRead can later flip
-    // it to 'read'). Compute against real length so 'all delivered' is
-    // meaningful only when there's actually someone to wait for.
+    // conversations the verdict is trivially true — compute against real
+    // length so 'all delivered' is meaningful only when there's actually
+    // someone to wait for.
     const recipients = await this.participantsExcept(event.conversationId, event.senderId);
     const allDelivered = recipients.length > 0 && recipients.every((id) => deliveredBy.has(id));
 
-    // Route status update to all participants except the acker (sender included).
-    // The FE upgrades only its own outgoing messages, matched by messageId.
+    // Route the frame ONLY to the sender's user node — its sole job is
+    // upgrading the sender's outgoing tick, and the sender's other devices
+    // share that node too (e.g. Alice's MacBook receives it so applyRead can
+    // later flip its row to 'read'). Other participants hold incoming rows
+    // and have no tick to upgrade — fanning out to them would broadcast
+    // receipt state nobody can act on, so we don't.
     // Best-effort: the receipt row is already persisted above, so a transient
     // fan-out failure must not rethrow — retrying would hit the dedup at the top
     // (row already written) and the gray-tick broadcast would be permanently
     // lost. Mirror the message_received fan-out handling in onKafkaMessageSent:
     // log the error, never rethrow.
     try {
-      const recipientIdsExcludingAcker = await this.participantsExcept(
-        event.conversationId,
-        event.recipientId,
-      );
       await this.deliveryPublisher.publishToUsers(
-        recipientIdsExcludingAcker,
+        [event.senderId],
         'message_delivered',
         {
           messageId: event.messageId,
