@@ -1,6 +1,11 @@
 # Messaging Platform
 
-A WhatsApp/Discord-style real-time chat backend — a pnpm + Turborepo monorepo with two NestJS services.
+![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)
+![NestJS](https://img.shields.io/badge/NestJS-E0234E?logo=nestjs&logoColor=white)
+![Kafka](https://img.shields.io/badge/Kafka-231F20?logo=apache-kafka&logoColor=white)
+![Cassandra](https://img.shields.io/badge/Cassandra-1287B1?logo=apache-cassandra&logoColor=white)
+
+A WhatsApp/Discord-style real-time chat backend — a pnpm + Turborepo monorepo with three NestJS services.
 
 | Service | Port | Protocol | Responsibility |
 |---|---|---|---|
@@ -10,7 +15,31 @@ A WhatsApp/Discord-style real-time chat backend — a pnpm + Turborepo monorepo 
 
 **Data stores:** PostgreSQL 15 (metadata, owner: api) · Cassandra 4.1 (messages + receipts, owner: **mss**) · Redis 7 (participant cache + shared connection registry — written by gateway, read by mss) · Kafka 3.9 / KRaft (event log).
 
-> Full technical reference: [ARCHITECTURE.md](ARCHITECTURE.md)
+## Architecture
+
+```
+React client (:5173, separate repo)
+   │  REST /api ───────────────────▶  api :3000 ──▶ PostgreSQL (users, conversations)
+   │  REST /gateway ───────────────▶  chat-gateway :8080
+   │  WS /ws (?token=<JWT>) ───────▶  chat-gateway :8080 (raw ws, Nest WsAdapter)
+                                                              │ publish MESSAGE_SENT
+                                                              ▼
+                                                       Kafka (chat-events)
+                                                              │ consume (mss-group)
+                                                              ▼
+                                                       mss :8081 ──▶ Cassandra (messages, receipts)
+                                                              │
+                        ┌───────────────────┬─────────────────┼───────────────┐
+                        │ registry lookup   │ read watermarks │ failures      │
+                        ▼                   ▼                 ▼               ▼
+                 Redis (registry)   api :3000 internal   DLQ topic    Redis pub/sub
+                 registry:user:*    (Postgres writes)    (3 retries)  delivery:{nodeId}
+                                                                          │
+                                                                          ▼
+                                                              gateway ──▶ WS frame to recipient
+```
+
+Send path: client `message` event → gateway publishes to Kafka → broker ACK → `message_sent` (one tick) back to the sender → mss persists to Cassandra, resolves recipient nodes via the Redis registry, and routes `message_received` over targeted per-node Redis pub/sub. Delivery/read receipts flow back the same way (see [Testing the services](#testing-the-services) for a live walkthrough).
 
 ## Prerequisites
 
@@ -31,7 +60,7 @@ docker compose up -d
 pnpm dev
 ```
 
-Environment is optional in dev (defaults match `docker-compose.yml`); see [.env.example](.env.example) for all variables. **In any real deployment, set `JWT_SECRET`** — both apps must share the same value.
+Environment is optional in dev (defaults match `docker-compose.yml`); see [.env.example](.env.example) for all variables. **In any real deployment, set `JWT_SECRET`** — all services must share the same value.
 
 ## Full install & run, step by step (fresh machine)
 
@@ -39,7 +68,7 @@ Environment is optional in dev (defaults match `docker-compose.yml`); see [.env.
 
 **2. Clone + install dependencies**
 ```bash
-git clone <your-repo-url> messaging-platform
+git clone https://github.com/jaiswalrobin/messaging-platform.git
 cd messaging-platform
 pnpm install
 ```
@@ -120,7 +149,34 @@ curl -s localhost:3000/health   # api
 curl -s localhost:8080/health   # chat-gateway
 ```
 
-A full end-to-end walkthrough (register users → create group → WebSocket chat → history) lives in [ARCHITECTURE.md §18](ARCHITECTURE.md#18-testing-guide).
+End-to-end walkthrough — register two users, chat over WebSocket, read history:
+
+```bash
+# 1. Register two users (api :3000) — save each userId + token
+curl -s -X POST localhost:3000/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"a@test.com","password":"password123"}'
+
+curl -s -X POST localhost:3000/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"b@test.com","password":"password123"}'
+
+# 2. Create a direct conversation as user A
+curl -s -X POST localhost:3000/conversations/direct \
+  -H "Authorization: Bearer $TOKEN_A" -H 'Content-Type: application/json' \
+  -d '{"targetUserId":"<USER_B_ID>"}'
+# (or a group: POST /conversations/group {"title":"...","participantIds":["..."]})
+
+# 3. Open a WebSocket as each user (raw ws, JWT in ?token=) and send a message.
+# With wscat (npm i -g wscat):
+wscat -c "ws://localhost:8080?token=$TOKEN_A"
+# > {"event":"message","data":{"conversationId":"<CONV_ID>","content":"hello","clientMessageId":"m1"}}
+# sender gets {"message_sent"...} (one tick); the other socket gets {"message_received"...}
+
+# 4. Read history back (gateway :8080 proxies to mss; default 20 messages)
+curl -s "localhost:8080/messages/<CONV_ID>?limit=20" \
+  -H "Authorization: Bearer $TOKEN_A"
+```
 
 ## Repo layout
 
@@ -131,7 +187,6 @@ apps/
 packages/
   shared-types/   @chat/shared-types — types + shared runtime config
 docker-compose.yml   postgres 15, redis 7, cassandra 4.1, kafka 3.9 (KRaft)
-ARCHITECTURE.md      exhaustive architecture reference
 ```
 
 ## Useful commands
